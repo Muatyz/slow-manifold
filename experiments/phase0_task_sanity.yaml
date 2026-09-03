@@ -1,0 +1,9 @@
+name: phase0_task_sanity
+seed: 20260903
+
+components:
+  task: ../configs/task/interval_categorization.yaml
+  model: ../configs/model/rank2_ctrnn.yaml
+  visualization: ../configs/visualization/task_sanity.yaml
+
+overrides: {}

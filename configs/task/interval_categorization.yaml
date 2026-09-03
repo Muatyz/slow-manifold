@@ -1,0 +1,37 @@
+name: delayed_interval_categorization
+
+threshold: 5.0
+stimulus:
+  waveform: square
+  width: 0.2
+  amplitude: 1.0
+response_window: 1.0
+pre_go_loss_weight: 0.1
+response_loss_weight: 1.0
+
+splits:
+  train:
+    short_interval: [2.0, 4.9]
+    long_interval: [5.1, 8.0]
+    delay: [1.0, 4.0]
+    s1_onset: [0.5, 1.5]
+  validation:
+    short_interval: [2.0, 4.9]
+    long_interval: [5.1, 8.0]
+    delay: [1.0, 4.0]
+    s1_onset: [0.5, 1.5]
+  ood_interval:
+    short_interval: [1.0, 1.9]
+    long_interval: [8.1, 9.0]
+    delay: [1.0, 4.0]
+    s1_onset: [0.5, 1.5]
+  ood_delay:
+    short_interval: [2.0, 4.9]
+    long_interval: [5.1, 8.0]
+    delay: [4.1, 6.0]
+    s1_onset: [0.5, 1.5]
+  ood_onset:
+    short_interval: [2.0, 4.9]
+    long_interval: [5.1, 8.0]
+    delay: [1.0, 4.0]
+    s1_onset: [1.6, 3.0]

@@ -1,0 +1,16 @@
+name: phase1_rank2_baseline
+seed: 20260903
+
+components:
+  task: ../configs/task/interval_categorization.yaml
+  model: ../configs/model/rank2_ctrnn.yaml
+  train: ../configs/train/rank2_baseline.yaml
+  analysis: ../configs/analysis/training_dynamics.yaml
+  visualization: ../configs/visualization/training_dynamics.yaml
+
+overrides:
+  train:
+    epochs: 20000
+    batch_size: 64
+  analysis:
+    representative_epochs: [0, 100, 500, 1000, 5000, 10000, 20000]

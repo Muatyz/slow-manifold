@@ -1,0 +1,18 @@
+name: training_dynamics
+input_condition: [0.0, 0.0, 0.0]
+representative_epochs: [0, 100, 500, 1000, 5000]
+grid_points: 25
+# 显式绘图范围 [x_min, x_max, y_min, y_max]; null 时由 trajectory 推导,
+# 且当 grid-minimum 候选贴近边缘(慢结构可能被截断)时按下面参数向外扩张。
+coordinate_bounds: null
+padding_fraction: 0.2
+bounds_expansion_fraction: 0.5
+max_bounds_expansions: 2
+speed_floor: 1.0e-8
+evaluation_trials:
+  - interval: 3.0
+    delay: 2.0
+    s1_onset: 1.0
+  - interval: 7.0
+    delay: 2.0
+    s1_onset: 1.0

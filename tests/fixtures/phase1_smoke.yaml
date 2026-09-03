@@ -1,0 +1,33 @@
+name: phase1_smoke
+seed: 17
+
+components:
+  task: ../../configs/task/interval_categorization.yaml
+  model: ../../configs/model/rank2_ctrnn.yaml
+  train: ../../configs/train/rank2_baseline.yaml
+  analysis: ../../configs/analysis/training_dynamics.yaml
+  visualization: ../../configs/visualization/training_dynamics.yaml
+
+overrides:
+  model:
+    state_size: 8
+  train:
+    device: cpu
+    epochs: 1
+    batch_size: 4
+    validation_batch_size: 4
+    log_every: 1
+    checkpoint:
+      every: 1
+  analysis:
+    representative_epochs: [0, 1]
+    grid_points: 7
+  visualization:
+    training_curves_figure_size: [4.0, 3.0]
+    outputs_panel_width: 2.0
+    outputs_panel_height: 1.5
+    vector_field_figure_size: [3.0, 3.0]
+    vector_field_dpi: 50
+    movie_fps: 2
+    movie_codec: libx264
+    arrow_stride: 2

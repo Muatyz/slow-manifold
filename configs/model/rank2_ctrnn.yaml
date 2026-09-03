@@ -1,0 +1,15 @@
+name: rank2_ctrnn
+input_size: 3
+state_size: 64
+rank: 2
+output_size: 1
+tau: 1.0
+dt: 0.1
+activation: tanh
+integrator: euler
+dtype: float32
+initialization:
+  factor_scale: 1.0
+  input_scale: 0.5
+  bias_scale: 0.0
+  readout_scale: 0.5

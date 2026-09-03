@@ -1,0 +1,17 @@
+name: training_dynamics
+training_curves_figure_size: [8.0, 6.0]
+outputs_panel_width: 4.0
+outputs_panel_height: 2.5
+vector_field_figure_size: [6.0, 5.5]
+vector_field_dpi: 120
+movie_fps: 5
+movie_codec: libx264
+# vector 箭头采样密度:在 flow grid 上每隔 n 个点画一个箭头, n 越小越密。
+# snapshot 与 movie 共用该参数; 可用 `slow visualize --arrow-stride <n>` 重绘。
+arrow_stride: 1
+# decision band = 决策模糊区,在 readout logit z 上的半宽 w(Dinc 约定:
+# band = z in (-w, w), 即 sigmoid 情形对应 sigma(-w)..sigma(w))。
+# 只有 band 内部被染色: z in (-w, 0)(输出为负, 偏向 -1)染红、
+# z in (0, w)(输出为正, 偏向 +1)染绿; |z| > w 为已确定的 ±1 区域,
+# 保持速度场原状不染色。w=0 时退化为仅保留决策边界。
+decision_band_logit_half_width: 1.0

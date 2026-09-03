@@ -1,0 +1,4 @@
+name: task_sanity
+batch_size: 32
+display_trials: 8
+figure_size: [12.0, 14.0]

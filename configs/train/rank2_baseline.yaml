@@ -1,0 +1,18 @@
+name: rank2_baseline
+device: cuda
+# PyTorch intra-op threads per training process.  CUDA wall-clock is insensitive
+# to this value (see notebooks/resource_benchmark.ipynb); the low cap frees CPU
+# cores for parallel multi-seed runs.  null keeps the process default.
+num_threads: 2
+epochs: 5000
+batch_size: 32
+validation_batch_size: 128
+log_every: 10
+optimizer:
+  name: adam
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+gradient_clip_norm: null
+checkpoint:
+  every: 100
