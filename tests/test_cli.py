@@ -31,18 +31,19 @@ def test_explicit_experiment_argument_is_parsed(
     assert args.output_dir is None
 
 
-def test_train_tag_is_parsed() -> None:
-    args = build_parser().parse_args(
-        [
-            "train",
-            "--experiment",
-            "experiments/phase1_rank2_baseline.yaml",
-            "--tag",
-            "lr1e-4",
-        ]
-    )
+def test_train_rejects_removed_tag_argument() -> None:
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(
+            [
+                "train",
+                "--experiment",
+                "experiments/phase1_rank2_baseline.yaml",
+                "--tag",
+                "lr1e-4",
+            ]
+        )
 
-    assert args.tag == "lr1e-4"
+    assert error.value.code == 2
 
 
 def test_visualize_run_argument_is_parsed() -> None:

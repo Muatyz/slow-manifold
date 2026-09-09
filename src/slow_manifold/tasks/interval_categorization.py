@@ -6,14 +6,15 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from numpy.typing import NDArray
 
-FloatArray = NDArray[np.float64]
-BoolArray = NDArray[np.bool_]
-
-
-class TaskConfigError(ValueError):
-    """Raised when task timing or sampling parameters are inconsistent."""
+from ._shared import (
+    TaskBatch,
+    TaskConfigError,
+    Trial,
+    TrialMetadata,
+    pair as _pair,
+    to_steps as _to_steps,
+)
 
 
 @dataclass(frozen=True)
@@ -142,37 +143,6 @@ class IntervalCategorizationConfig:
                 )
 
 
-@dataclass(frozen=True)
-class TrialMetadata:
-    s1_step: int
-    s2_step: int
-    go_step: int
-    response_step: int
-    trial_steps: int
-    interval: float
-    delay: float
-    class_label: int
-    split: str
-
-
-@dataclass(frozen=True)
-class Trial:
-    inputs: FloatArray
-    target: FloatArray
-    loss_mask: FloatArray
-    metadata: TrialMetadata
-
-
-@dataclass(frozen=True)
-class TaskBatch:
-    inputs: FloatArray
-    target: FloatArray
-    loss_mask: FloatArray
-    valid_mask: BoolArray
-    metadata: tuple[TrialMetadata, ...]
-    dt: float
-
-
 class IntervalCategorizationTask:
     """Generate balanced delayed interval-categorization trials."""
 
@@ -282,7 +252,21 @@ class IntervalCategorizationTask:
             valid_mask=valid_mask,
             metadata=tuple(trial.metadata for trial in trials),
             dt=self.config.dt,
+            input_names=self.input_names,
+            loss_reduction="weighted_mean",
         )
+
+    def evaluate_prediction(
+        self, prediction: np.ndarray, batch: TaskBatch
+    ) -> dict[str, float]:
+        """Return the response-window categorization accuracy."""
+        response = batch.target != 0
+        predicted_class = np.where(prediction >= 0, 1.0, -1.0)
+        return {
+            "validation_accuracy": float(
+                np.mean(predicted_class[response] == batch.target[response])
+            )
+        }
 
     def _sample_time(
         self, bounds: tuple[float, float], rng: np.random.Generator
@@ -290,19 +274,3 @@ class IntervalCategorizationTask:
         low = _to_steps(bounds[0], self.config.dt, "range lower bound", allow_zero=True)
         high = _to_steps(bounds[1], self.config.dt, "range upper bound", allow_zero=True)
         return int(rng.integers(low, high + 1)) * self.config.dt
-
-
-def _pair(value: Any) -> tuple[float, float]:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise TaskConfigError("Expected a two-element range")
-    return float(value[0]), float(value[1])
-
-
-def _to_steps(value: float, dt: float, name: str, *, allow_zero: bool = False) -> int:
-    steps = int(round(float(value) / dt))
-    minimum = 0 if allow_zero else 1
-    if steps < minimum:
-        raise TaskConfigError(f"{name} must contain at least {minimum} time steps")
-    if not np.isclose(steps * dt, value, rtol=0.0, atol=1e-9):
-        raise TaskConfigError(f"{name}={value} is not aligned to dt={dt}")
-    return steps

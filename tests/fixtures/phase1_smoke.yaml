@@ -1,5 +1,8 @@
 name: phase1_smoke
 seed: 17
+identity:
+  label_fields:
+    lr: train.optimizer.learning_rate
 
 components:
   task: ../../configs/task/interval_categorization.yaml
@@ -7,6 +10,7 @@ components:
   train: ../../configs/train/rank2_baseline.yaml
   analysis: ../../configs/analysis/training_dynamics.yaml
   visualization: ../../configs/visualization/training_dynamics.yaml
+  reporting: ../../configs/reporting/training_startup.yaml
 
 overrides:
   model:

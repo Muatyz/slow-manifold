@@ -139,6 +139,37 @@ class Rank2CTRNN(nn.Module):
         drive = kappa @ self.m.T + inputs @ self.input_weight.T + self.bias
         return (-kappa + torch.tanh(drive) @ self.n) / self.config.tau
 
+    def row_space_flow(
+        self, coordinates: Tensor, inputs: Tensor, basis: Tensor
+    ) -> Tensor:
+        """Exact flow in an orthonormal basis spanning the row space of ``W``."""
+        loading = self.recurrent_matrix @ basis
+        drive = (
+            coordinates @ loading.T
+            + inputs @ self.input_weight.T
+            + self.bias
+        )
+        return (-coordinates + torch.tanh(drive) @ basis) / self.config.tau
+
+    def row_space_jacobian(
+        self, coordinates: Tensor, inputs: Tensor, basis: Tensor
+    ) -> Tensor:
+        """Analytic continuous-time Jacobian of :meth:`row_space_flow`."""
+        loading = self.recurrent_matrix @ basis
+        drive = (
+            coordinates @ loading.T
+            + inputs @ self.input_weight.T
+            + self.bias
+        )
+        activation_slope = 1.0 - torch.tanh(drive).square()
+        recurrent_term = torch.einsum(
+            "hi,...h,hj->...ij", basis, activation_slope, loading
+        )
+        identity = torch.eye(
+            basis.shape[1], dtype=coordinates.dtype, device=coordinates.device
+        )
+        return (recurrent_term - identity) / self.config.tau
+
     def readout(self, kappa: Tensor) -> Tensor:
         return torch.tanh(kappa @ self.readout_weight + self.readout_bias)
 

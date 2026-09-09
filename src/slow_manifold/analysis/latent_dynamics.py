@@ -12,8 +12,14 @@ from numpy.typing import NDArray
 
 from slow_manifold.config import dump_yaml
 from slow_manifold.models import Rank2CTRNN, Rank2CTRNNConfig
-from slow_manifold.tasks import IntervalCategorizationTask, TaskBatch
+from slow_manifold.tasks import ConfiguredTask, TaskBatch
 from slow_manifold.training.checkpoint import load_checkpoint
+
+from .speed_minima import (
+    ClassifiedSpeedMinima,
+    SpeedMinimumClassificationConfig,
+    refine_and_classify_speed_minima,
+)
 
 
 class AnalysisConfigError(ValueError):
@@ -38,6 +44,7 @@ class AnalysisConfig:
     bounds_expansion_fraction: float
     max_bounds_expansions: int
     speed_floor: float
+    speed_minimum_classification: SpeedMinimumClassificationConfig
     evaluation_trials: tuple[EvaluationTrialConfig, ...]
 
     @classmethod
@@ -72,6 +79,11 @@ class AnalysisConfig:
                 ),
                 max_bounds_expansions=int(data.get("max_bounds_expansions", 2)),
                 speed_floor=float(data["speed_floor"]),
+                speed_minimum_classification=(
+                    SpeedMinimumClassificationConfig.from_mapping(
+                        data.get("speed_minimum_classification")
+                    )
+                ),
                 evaluation_trials=trials,
             )
         except (KeyError, TypeError) as error:
@@ -115,7 +127,7 @@ def analyze_checkpoints(
     *,
     checkpoint_paths: Mapping[int, Path],
     model_config: Rank2CTRNNConfig,
-    task: IntervalCategorizationTask,
+    task: ConfiguredTask,
     config: AnalysisConfig,
     output_dir: Path,
 ) -> LatentDynamicsResult:
@@ -142,6 +154,7 @@ def analyze_checkpoints(
         payload = load_checkpoint(checkpoint_paths[int(epoch)])
         model.load_state_dict(payload["model_state"])
         model.eval()
+        model.requires_grad_(False)
         with torch.no_grad():
             prediction, states, _ = model.rollout(inputs)
             basis = _aligned_row_space_basis(model.recurrent_matrix, previous_basis)
@@ -179,8 +192,24 @@ def analyze_checkpoints(
     speeds = grid["speeds"]
     speed_minima = grid["speed_minima"]
     grid_outputs = grid["grid_outputs"]
+    jacobian_eigenvalues = grid["jacobian_eigenvalues"]
+    jacobian_spectral_abscissa = grid["jacobian_spectral_abscissa"]
     grid_x = grid["grid_x"]
     grid_y = grid["grid_y"]
+    classified_minima = [
+        refine_and_classify_speed_minima(
+            model=model,
+            basis=torch.as_tensor(basis, dtype=model_config.torch_dtype),
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_minimum_mask=minimum_mask,
+            input_condition=config.input_condition,
+            bounds=bounds,
+            config=config.speed_minimum_classification,
+        )
+        for model, basis, minimum_mask in zip(models, bases, speed_minima)
+    ]
+    minimum_data = _combine_classified_minima(classified_minima)
     if bounds_source == "trajectory" and expansions:
         bounds_source = f"trajectory+edge_minima_expansion({expansions})"
 
@@ -202,7 +231,10 @@ def analyze_checkpoints(
         flow=np.stack(flows),
         speed=np.stack(speeds),
         speed_minimum_mask=np.stack(speed_minima),
+        **minimum_data,
         grid_output=np.stack(grid_outputs),
+        jacobian_eigenvalues=jacobian_eigenvalues,
+        jacobian_spectral_abscissa=jacobian_spectral_abscissa,
         trajectory=np.stack(trajectories),
         prediction=np.stack(predictions),
         target=evaluation_batch.target,
@@ -210,6 +242,18 @@ def analyze_checkpoints(
         inputs=evaluation_batch.inputs,
         bounds=np.asarray(bounds),
         input_condition=np.asarray(config.input_condition),
+        task_name=np.asarray(task.config.name),
+        trial_interval=np.asarray([item.interval for item in evaluation_batch.metadata]),
+        trial_delay=np.asarray([item.delay for item in evaluation_batch.metadata]),
+        trial_s1_step=np.asarray([item.s1_step for item in evaluation_batch.metadata]),
+        trial_s2_step=np.asarray([item.s2_step for item in evaluation_batch.metadata]),
+        trial_go_step=np.asarray([item.go_step for item in evaluation_batch.metadata]),
+        trial_response_step=np.asarray(
+            [item.response_step for item in evaluation_batch.metadata]
+        ),
+        trial_steps=np.asarray(
+            [item.trial_steps for item in evaluation_batch.metadata]
+        ),
     )
     metadata_path = output_dir / "latent_dynamics.yaml"
     dump_yaml(
@@ -224,6 +268,21 @@ def analyze_checkpoints(
                 "tau*dκ/dt = -κ + Q^T tanh(WQκ + W_in*u + b)"
             ),
             "speed_definition": "||tau * F_kappa||_2",
+            "jacobian_definition": (
+                "J_kappa = tau^-1[-I + Q^T diag(1-tanh^2(WQ*kappa "
+                "+ W_in*u + b)) WQ]"
+            ),
+            "jacobian_method": (
+                "exact analytic continuous-time row-space Jacobian"
+            ),
+            "jacobian_eigenvalue_units": "inverse configured time unit",
+            "spectral_abscissa_definition": (
+                "max_i Re(lambda_i(J_kappa)); sampled on the full aligned grid"
+            ),
+            "spectral_abscissa_scope": (
+                "descriptive plane map, not a slow-point, ghost, or "
+                "bifurcation classification"
+            ),
             "input_condition": list(config.input_condition),
             "coordinate_basis": (
                 "right-singular row-space basis of W, sequentially aligned by "
@@ -231,12 +290,38 @@ def analyze_checkpoints(
             ),
             "coordinate_bounds": list(bounds),
             "coordinate_bounds_source": bounds_source,
+            "grid_points": config.grid_points,
             "speed_floor": config.speed_floor,
             "speed_minimum_definition": (
-                "descriptive grid candidates no larger than their eight neighbors; "
-                "not optimized or classified slow points"
+                "eight-neighbor grid candidates refined by minimizing "
+                "q=0.5*||tau*F_kappa||^2"
             ),
+            "speed_minimum_classification": {
+                **asdict(config.speed_minimum_classification),
+                "fixed_point": (
+                    "local q minimum with normalized speed no greater than "
+                    "fixed_speed_tolerance; is_attractor additionally requires "
+                    "all eigenvalue real parts below negative stability tolerance"
+                ),
+                "slow_point": (
+                    "nonzero local q minimum that does not meet the ghost criterion"
+                ),
+                "latent_ghost_candidate": (
+                    "nonzero local q minimum with one effective zero eigenvalue "
+                    "and all remaining latent modes transversely stable"
+                ),
+                "scope": (
+                    "Dinc-style exact rank-2 latent classification; ghost remains "
+                    "a candidate until task relevance and cross-run evidence are checked"
+                ),
+            },
             "evaluation_trials": [asdict(item) for item in config.evaluation_trials],
+            "trajectory_phase_definition": {
+                "interval_encoding": "[S1, S2)",
+                "delay": "[S2, Go)",
+                "post_go_timing": "[Go, target response onset)",
+                "response": "[target response onset, trial end)",
+            },
         },
         metadata_path,
     )
@@ -248,8 +333,40 @@ def analyze_checkpoints(
     )
 
 
+def _combine_classified_minima(
+    results: Sequence[ClassifiedSpeedMinima],
+) -> dict[str, np.ndarray]:
+    counts = np.asarray([result.coordinates.shape[0] for result in results])
+    epoch_index = np.repeat(np.arange(len(results), dtype=np.int64), counts)
+
+    def concatenate(name: str) -> np.ndarray:
+        arrays = [getattr(result, name) for result in results]
+        return np.concatenate(arrays, axis=0)
+
+    return {
+        "speed_minimum_epoch_index": epoch_index,
+        "speed_minimum_coordinates": concatenate("coordinates"),
+        "speed_minimum_flow": concatenate("flow"),
+        "speed_minimum_speed": concatenate("speed"),
+        "speed_minimum_q": concatenate("q"),
+        "speed_minimum_jacobian": concatenate("jacobian"),
+        "speed_minimum_eigenvalues": concatenate("eigenvalues"),
+        "speed_minimum_q_gradient_norm": concatenate("q_gradient_norm"),
+        "speed_minimum_q_hessian_eigenvalues": concatenate(
+            "q_hessian_eigenvalues"
+        ),
+        "speed_minimum_optimization_converged": concatenate(
+            "optimization_converged"
+        ),
+        "speed_minimum_is_local_minimum": concatenate("is_local_minimum"),
+        "speed_minimum_is_attractor": concatenate("is_attractor"),
+        "speed_minimum_classification": concatenate("classification"),
+        "speed_minimum_source_count": concatenate("source_count"),
+    }
+
+
 def _evaluation_batch(
-    task: IntervalCategorizationTask,
+    task: ConfiguredTask,
     configurations: Sequence[EvaluationTrialConfig],
 ) -> TaskBatch:
     trials = [
@@ -309,7 +426,7 @@ def _evaluate_latent_grid(
     bounds: tuple[float, float, float, float],
     grid_points: int,
 ) -> dict[str, Any]:
-    """Evaluate flow, speed, grid minima, and readout on one aligned grid."""
+    """Evaluate flow, spectrum, speed minima, and readout on one aligned grid."""
     x_values = np.linspace(bounds[0], bounds[1], grid_points)
     y_values = np.linspace(bounds[2], bounds[3], grid_points)
     grid_x, grid_y = np.meshgrid(x_values, y_values)
@@ -325,16 +442,16 @@ def _evaluate_latent_grid(
     speeds: list[np.ndarray] = []
     speed_minima: list[np.ndarray] = []
     grid_outputs: list[np.ndarray] = []
+    jacobian_eigenvalues: list[np.ndarray] = []
+    jacobian_spectral_abscissa: list[np.ndarray] = []
     for model, basis_array in zip(models, bases):
         basis = torch.as_tensor(basis_array, dtype=model_config.torch_dtype)
         with torch.no_grad():
-            loading = model.recurrent_matrix @ basis
-            drive = (
-                points @ loading.T
-                + input_condition_t @ model.input_weight.T
-                + model.bias
+            flow = model.row_space_flow(points, input_condition_t, basis)
+            jacobian = model.row_space_jacobian(
+                points, input_condition_t, basis
             )
-            flow = (-points + torch.tanh(drive) @ basis) / model_config.tau
+            eigenvalues = torch.linalg.eigvals(jacobian)
             normalized_speed = torch.linalg.vector_norm(
                 model_config.tau * flow, dim=-1
             )
@@ -349,6 +466,13 @@ def _evaluate_latent_grid(
         grid_outputs.append(
             grid_output.reshape(grid_points, grid_points).numpy()
         )
+        eigenvalue_grid = eigenvalues.reshape(
+            grid_points, grid_points, model_config.rank
+        ).numpy()
+        jacobian_eigenvalues.append(eigenvalue_grid)
+        jacobian_spectral_abscissa.append(
+            eigenvalue_grid.real.max(axis=-1)
+        )
     return {
         "grid_x": grid_x,
         "grid_y": grid_y,
@@ -356,6 +480,8 @@ def _evaluate_latent_grid(
         "speeds": np.stack(speeds),
         "speed_minima": np.stack(speed_minima),
         "grid_outputs": np.stack(grid_outputs),
+        "jacobian_eigenvalues": np.stack(jacobian_eigenvalues),
+        "jacobian_spectral_abscissa": np.stack(jacobian_spectral_abscissa),
     }
 
 

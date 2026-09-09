@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -47,7 +50,7 @@ class ResolvedExperiment:
     components: dict[str, dict[str, Any]]
     component_sources: dict[str, str]
     source: str
-    tag: str | None = None
+    identity_fields: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -57,23 +60,48 @@ class ResolvedExperiment:
             "component_sources": deepcopy(self.component_sources),
             "components": deepcopy(self.components),
         }
-        if self.tag is not None:
-            data["tag"] = self.tag
+        if self.identity_fields:
+            data["identity"] = {"label_fields": deepcopy(self.identity_fields)}
         return data
 
-    def default_run_dir(self, runs_root: str | Path = "runs") -> Path:
-        """Derive the conventional run directory from experiment identity.
+    @property
+    def condition_fingerprint(self) -> str:
+        """Stable hash of parameters that can change the trained network."""
+        payload = {
+            name: self.components[name]
+            for name in ("task", "model", "train")
+            if name in self.components
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()[:10]
 
-        Runs are separated by an optional ``tag`` so that identical recipes
-        with different hyper-parameters (e.g. a learning-rate scan) never
-        collide: ``runs/<name>/<tag>-seed-<seed>`` without a tag falls back
-        to ``runs/<name>/seed-<seed>``.
-        """
+    @property
+    def condition_label(self) -> str | None:
+        """Human-readable label derived from real resolved config values."""
+        if not self.identity_fields:
+            return None
+        parts = []
+        for label, path in self.identity_fields.items():
+            value = get_config_value(self.components, path)
+            parts.append(f"{_slug(label)}-{_slug(value)}")
+        return "__".join(parts)
+
+    def default_run_dir(self, runs_root: str | Path = "runs") -> Path:
+        """Derive a traceable run path from condition identity and seed."""
         root = Path(runs_root) / self.name
-        directory = root / f"seed-{self.seed}"
-        if self.tag is not None:
-            directory = root / f"{self.tag}-seed-{self.seed}"
-        return directory.resolve()
+        fingerprint = f"cfg-{self.condition_fingerprint}"
+        condition = (
+            fingerprint
+            if self.condition_label is None
+            else f"{self.condition_label}--{fingerprint}"
+        )
+        return (root / condition / f"seed-{self.seed}").resolve()
 
 
 def resolve_experiment(path: str | Path) -> ResolvedExperiment:
@@ -85,16 +113,26 @@ def resolve_experiment(path: str | Path) -> ResolvedExperiment:
     seed = recipe.get("seed")
     references = recipe.get("components")
     overrides = recipe.get("overrides", {})
-    tag = recipe.get("tag")
+    identity = recipe.get("identity", {})
+    if "tag" in recipe:
+        raise ConfigError(
+            "Experiment 'tag' is no longer supported; encode the condition in "
+            "component overrides and optional identity.label_fields"
+        )
     if not isinstance(name, str) or not name.strip():
         raise ConfigError("Experiment 'name' must be a non-empty string")
     _require_path_component(name, "name")
     if not isinstance(seed, int):
         raise ConfigError("Experiment 'seed' must be an integer")
-    if tag is not None:
-        if not isinstance(tag, str) or not tag.strip():
-            raise ConfigError("Experiment 'tag' must be a non-empty string")
-        _require_path_component(tag, "tag")
+    if not isinstance(identity, Mapping):
+        raise ConfigError("Experiment 'identity' must be a mapping")
+    unknown_identity_fields = set(identity) - {"label_fields"}
+    if unknown_identity_fields:
+        names = ", ".join(sorted(str(name) for name in unknown_identity_fields))
+        raise ConfigError(f"Unknown experiment identity fields: {names}")
+    label_fields = identity.get("label_fields", {})
+    if not isinstance(label_fields, Mapping):
+        raise ConfigError("Experiment identity.label_fields must be a mapping")
     if not isinstance(references, Mapping) or not references:
         raise ConfigError("Experiment 'components' must be a non-empty mapping")
     if not isinstance(overrides, Mapping):
@@ -118,20 +156,62 @@ def resolve_experiment(path: str | Path) -> ResolvedExperiment:
         components[component_name] = deep_merge(component, component_override)
         sources[component_name] = reference
 
+    resolved_identity_fields: dict[str, str] = {}
+    for label, value_path in label_fields.items():
+        if not isinstance(label, str) or not label.strip():
+            raise ConfigError("Identity labels must be non-empty strings")
+        if not isinstance(value_path, str) or not value_path.strip():
+            raise ConfigError("Identity value paths must be non-empty strings")
+        value = get_config_value(components, value_path)
+        if isinstance(value, (Mapping, list, tuple)):
+            raise ConfigError(
+                f"Identity path '{value_path}' must resolve to a scalar value"
+            )
+        resolved_identity_fields[label] = value_path
+
     return ResolvedExperiment(
         name=name,
         seed=seed,
-        tag=tag,
         components=components,
         component_sources=sources,
         source=str(recipe_path),
+        identity_fields=resolved_identity_fields,
     )
+
+
+def get_config_value(components: Mapping[str, Any], path: str) -> Any:
+    """Resolve a dotted path such as ``train.optimizer.learning_rate``."""
+    value: Any = components
+    for part in path.split("."):
+        if not part or not isinstance(value, Mapping) or part not in value:
+            raise ConfigError(f"Config value path does not exist: {path}")
+        value = value[part]
+    return value
 
 
 def _require_path_component(value: str, field: str) -> None:
     """Reject values that could escape or collide inside a run directory."""
     if value in {".", ".."} or "/" in value or "\\" in value:
         raise ConfigError(f"Experiment '{field}' must be a single path-safe name")
+
+
+def _slug(value: Any) -> str:
+    """Format a scalar as a compact, path-safe condition token."""
+    if isinstance(value, bool):
+        text = str(value).lower()
+    elif isinstance(value, float):
+        magnitude = abs(value)
+        if value != 0 and (magnitude < 0.01 or magnitude >= 10000):
+            mantissa, exponent = f"{value:.6e}".split("e")
+            text = f"{mantissa.rstrip('0').rstrip('.')}e{int(exponent)}"
+        else:
+            text = f"{value:.8g}"
+    else:
+        text = str(value).strip()
+    token = re.sub(r"[^A-Za-z0-9._+-]+", "-", text).strip("-.")
+    if not token:
+        raise ConfigError(f"Cannot form a path-safe identity token from {value!r}")
+    return token
 
 
 def dump_yaml(data: Mapping[str, Any], path: str | Path) -> None:

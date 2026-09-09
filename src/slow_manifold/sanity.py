@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from slow_manifold.config import ResolvedExperiment, dump_yaml, resolve_experiment
-from slow_manifold.tasks import IntervalCategorizationConfig, IntervalCategorizationTask
+from slow_manifold.tasks import create_task
 from slow_manifold.utils import collect_runtime_metadata, make_rng
 from slow_manifold.visualization import plot_task_batch
 
@@ -27,9 +27,6 @@ def create_task_sanity_run(
     model_config = experiment.components["model"]
     if "dt" not in model_config:
         raise ValueError("Model component must define dt")
-    task_config = IntervalCategorizationConfig.from_mapping(
-        experiment.components["task"], dt=float(model_config["dt"])
-    )
     visualization_config = experiment.components["visualization"]
     requested_batch_size = (
         int(batch_size)
@@ -50,13 +47,23 @@ def create_task_sanity_run(
 
     rng_namespace = f"task:{split}"
     rng = make_rng(experiment.seed, rng_namespace)
-    task = IntervalCategorizationTask(task_config, split=split)
+    task = create_task(
+        experiment.components["task"], dt=float(model_config["dt"]), split=split
+    )
     batch = task.generate_batch(requested_batch_size, rng)
+    expected_inputs = int(model_config.get("input_size", batch.inputs.shape[-1]))
+    if batch.inputs.shape[-1] != expected_inputs:
+        raise ValueError(
+            "Task input channels do not match model input_size: "
+            f"{batch.inputs.shape[-1]} != {expected_inputs}"
+        )
 
     resolved = experiment.as_dict()
     resolved["run"] = {
         "kind": "task_sanity",
         "split": split,
+        "condition_label": experiment.condition_label,
+        "condition_fingerprint": experiment.condition_fingerprint,
         "output_dir": str(run_dir),
     }
     dump_yaml(resolved, run_dir / "config.yaml")
@@ -65,6 +72,10 @@ def create_task_sanity_run(
             experiment_name=experiment.name,
             seed=experiment.seed,
             rng_streams={"task": rng_namespace},
+            extra={
+                "condition_label": experiment.condition_label,
+                "condition_fingerprint": experiment.condition_fingerprint,
+            },
         ),
         run_dir / "metadata.yaml",
     )

@@ -1,0 +1,14 @@
+name: phase0_reproduction_task_sanity
+seed: 20260903
+
+components:
+  task: ../configs/task/interval_reproduction.yaml
+  model: ../configs/model/rank2_ctrnn.yaml
+  visualization: ../configs/visualization/task_sanity.yaml
+
+overrides:
+  # Shared cue input and alpha=dt/tau=0.1 are explicit operational choices.
+  model:
+    input_size: 1
+    tau: 10.0
+    dt: 1.0

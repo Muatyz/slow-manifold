@@ -31,6 +31,28 @@ def test_full_and_exact_latent_flows_agree() -> None:
     torch.testing.assert_close(projected_full_flow, exact_latent_flow)
 
 
+def test_row_space_jacobian_matches_autograd() -> None:
+    model = make_model()
+    basis = torch.linalg.qr(model.n.detach(), mode="reduced").Q
+    coordinates = torch.randn(3, model.config.rank)
+    inputs = torch.randn(3, model.config.input_size)
+
+    analytic = model.row_space_jacobian(coordinates, inputs, basis)
+    automatic = torch.stack(
+        [
+            torch.autograd.functional.jacobian(
+                lambda point: model.row_space_flow(
+                    point.unsqueeze(0), inputs[index : index + 1], basis
+                ).squeeze(0),
+                coordinates[index],
+            )
+            for index in range(coordinates.shape[0])
+        ]
+    )
+
+    torch.testing.assert_close(analytic, automatic, rtol=1e-5, atol=1e-6)
+
+
 def test_rollout_shapes_are_batch_first() -> None:
     model = make_model()
     inputs = torch.zeros(4, 11, model.config.input_size)

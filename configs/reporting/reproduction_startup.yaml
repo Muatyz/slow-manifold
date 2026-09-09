@@ -1,0 +1,22 @@
+name: reproduction_startup
+enabled: true
+sections:
+  - label: Task
+    title: Interval Reproduction
+    fields:
+      - {label: waveform, path: task.stimulus.waveform}
+      - {label: loss, path: task.loss.name}
+      - {label: response threshold, path: task.evaluation.response_threshold}
+  - label: Model
+    title: Vanilla RNN
+    fields:
+      - {label: N, path: model.state_size}
+      - {label: rank, path: model.rank}
+      - {label: activation, path: model.activation}
+  - label: Train
+    fields:
+      - {label: optimizer, path: train.optimizer.name}
+      - {label: learning rate, path: train.optimizer.learning_rate}
+      - {label: batch size, path: train.batch_size}
+      - {label: updates, path: train.epochs}
+      - {label: device, path: train.device}

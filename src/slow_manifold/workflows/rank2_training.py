@@ -16,7 +16,7 @@ import torch
 from slow_manifold.analysis import AnalysisConfig, analyze_checkpoints
 from slow_manifold.config import ResolvedExperiment, dump_yaml, resolve_experiment
 from slow_manifold.models import Rank2CTRNN, Rank2CTRNNConfig
-from slow_manifold.tasks import IntervalCategorizationConfig, IntervalCategorizationTask
+from slow_manifold.tasks import create_task
 from slow_manifold.training import TrainConfig, train_model
 from slow_manifold.utils import (
     collect_runtime_metadata,
@@ -24,10 +24,13 @@ from slow_manifold.utils import (
     get_logger,
     make_rng,
     setup_run_logging,
+    startup_summary_lines,
 )
 from slow_manifold.visualization import (
     plot_representative_outputs,
     plot_training_curves,
+    render_latent_dynamics_collection,
+    render_latent_jacobian_collection,
     render_latent_vector_field_collection,
 )
 
@@ -39,21 +42,19 @@ def run_rank2_training(
     epochs: int | None = None,
     batch_size: int | None = None,
     device: str | None = None,
-    tag: str | None = None,
 ) -> Path:
     """Run a new traceable training experiment and generate requested figures.
 
     Maintains the run lifecycle in ``status.yaml`` (``running`` ->
     ``complete``/``failed``/``interrupted``) and appends every event to
-    ``run.log`` inside the run directory.  ``tag`` further separates the run
-    directory (e.g. for learning-rate scans sharing one recipe).
+    ``run.log`` inside the run directory. The run identity is derived from
+    the resolved training configuration and seed.
     """
     experiment = _with_cli_overrides(
         resolve_experiment(experiment_path),
         epochs=epochs,
         batch_size=batch_size,
         device=device,
-        tag=tag,
     )
     run_dir = (
         experiment.default_run_dir()
@@ -71,10 +72,12 @@ def run_rank2_training(
     started_utc = datetime.now(timezone.utc)
     wall_started = time.perf_counter()
     logger.info(
-        "run started experiment=%s seed=%d tag=%s device=%s output=%s",
+        "run started experiment=%s condition=%s fingerprint=%s seed=%d "
+        "device=%s output=%s",
         experiment.name,
+        experiment.condition_label or "-",
+        experiment.condition_fingerprint,
         experiment.seed,
-        experiment.tag or "-",
         experiment.components.get("train", {}).get("device", "unknown"),
         run_dir,
     )
@@ -125,19 +128,44 @@ def _run_experiment_pipeline(
     """Resolve components, train, diagnose, and plot for a fresh run."""
     logger = get_logger("run")
     _require_components(
-        experiment, "task", "model", "train", "analysis", "visualization"
+        experiment,
+        "task",
+        "model",
+        "train",
+        "analysis",
+        "visualization",
+        "reporting",
     )
     model_config = Rank2CTRNNConfig.from_mapping(experiment.components["model"])
-    task_config = IntervalCategorizationConfig.from_mapping(
-        experiment.components["task"], dt=model_config.dt
+    train_task = create_task(
+        experiment.components["task"], dt=model_config.dt, split="train"
+    )
+    validation_task = create_task(
+        experiment.components["task"], dt=model_config.dt, split="validation"
     )
     train_config = TrainConfig.from_mapping(experiment.components["train"])
     analysis_config = AnalysisConfig.from_mapping(experiment.components["analysis"])
     visualization_config = experiment.components["visualization"]
-    _validate_cross_component_config(model_config, analysis_config, train_config)
+    reporting_config = experiment.components["reporting"]
+    response_threshold = float(
+        experiment.components["task"].get("evaluation", {}).get(
+            "response_threshold", 0.5
+        )
+    )
+    _validate_cross_component_config(
+        model_config, analysis_config, train_config, len(train_task.input_names)
+    )
+
+    for line in startup_summary_lines(experiment.components, reporting_config):
+        logger.info("configuration %s", line)
 
     resolved = experiment.as_dict()
-    resolved["run"] = {"kind": "rank2_training", "output_dir": str(run_dir)}
+    resolved["run"] = {
+        "kind": "rank2_training",
+        "condition_label": experiment.condition_label,
+        "condition_fingerprint": experiment.condition_fingerprint,
+        "output_dir": str(run_dir),
+    }
     dump_yaml(resolved, run_dir / "config.yaml")
     rng_streams = {
         "model": "model:initialization",
@@ -158,6 +186,8 @@ def _run_experiment_pipeline(
             ),
             extra={
                 "device": train_config.device,
+                "condition_label": experiment.condition_label,
+                "condition_fingerprint": experiment.condition_fingerprint,
                 "num_threads": train_config.num_threads,
                 "interop_threads": torch.get_num_interop_threads(),
                 **_device_metadata(train_config.device),
@@ -176,8 +206,6 @@ def _run_experiment_pipeline(
     model = Rank2CTRNN(model_config, generator=model_generator)
     train_rng = make_rng(experiment.seed, rng_streams["task_train"])
     validation_rng = make_rng(experiment.seed, rng_streams["task_validation"])
-    train_task = IntervalCategorizationTask(task_config, split="train")
-    validation_task = IntervalCategorizationTask(task_config, split="validation")
     validation_batch = validation_task.generate_batch(
         train_config.validation_batch_size, validation_rng
     )
@@ -238,6 +266,7 @@ def _run_experiment_pipeline(
         decision_band_logit_half_width=float(
             visualization_config.get("decision_band_logit_half_width", 1.0)
         ),
+        response_threshold=response_threshold,
     )
     visualization_logger.info(
         "figure written file=representative_outputs.png elapsed_seconds=%.2fs",
@@ -254,14 +283,66 @@ def _run_experiment_pipeline(
         fps=int(visualization_config["movie_fps"]),
         codec=str(visualization_config["movie_codec"]),
         arrow_stride=int(visualization_config["arrow_stride"]),
+        arrow_color=str(visualization_config.get("arrow_color", "black")),
+        arrow_length_fraction=float(
+            visualization_config.get("arrow_length_fraction", 0.012)
+        ),
+        arrow_width=float(visualization_config.get("arrow_width", 0.002)),
         decision_band_logit_half_width=float(
             visualization_config.get("decision_band_logit_half_width", 1.0)
         ),
+        response_threshold=response_threshold,
     )
     visualization_logger.info(
         "vector field artifacts written snapshots=%d movie=latent_vector_field.mp4 "
         "elapsed_seconds=%.2fs",
         len(vector_fields["snapshots"]),
+        time.perf_counter() - started,
+    )
+    started = time.perf_counter()
+    jacobian_snapshots = render_latent_jacobian_collection(
+        latent_result.data_path,
+        figures / "latent_jacobian",
+        representative_epochs=latent_result.representative_epochs,
+        figure_size=visualization_config["vector_field_figure_size"],
+        dpi=int(visualization_config["vector_field_dpi"]),
+        spectral_abscissa_limit=visualization_config.get(
+            "jacobian_spectral_abscissa_limit"
+        ),
+    )
+    visualization_logger.info(
+        "latent Jacobian artifacts written snapshots=%d elapsed_seconds=%.2fs",
+        len(jacobian_snapshots),
+        time.perf_counter() - started,
+    )
+    started = time.perf_counter()
+    combined = render_latent_dynamics_collection(
+        latent_result.data_path,
+        figures / "latent_dynamics",
+        representative_epochs=latent_result.representative_epochs,
+        speed_floor=analysis_config.speed_floor,
+        figure_size=_combined_figure_size(visualization_config),
+        dpi=int(visualization_config["vector_field_dpi"]),
+        fps=int(visualization_config["movie_fps"]),
+        codec=str(visualization_config["movie_codec"]),
+        arrow_stride=int(visualization_config["arrow_stride"]),
+        arrow_color=str(visualization_config.get("arrow_color", "black")),
+        arrow_length_fraction=float(
+            visualization_config.get("arrow_length_fraction", 0.012)
+        ),
+        arrow_width=float(visualization_config.get("arrow_width", 0.002)),
+        decision_band_logit_half_width=float(
+            visualization_config.get("decision_band_logit_half_width", 1.0)
+        ),
+        response_threshold=response_threshold,
+        spectral_abscissa_limit=visualization_config.get(
+            "jacobian_spectral_abscissa_limit"
+        ),
+    )
+    visualization_logger.info(
+        "combined latent dynamics artifacts written snapshots=%d "
+        "movie=latent_dynamics.mp4 elapsed_seconds=%.2fs",
+        len(combined["snapshots"]),
         time.perf_counter() - started,
     )
     return {
@@ -297,6 +378,14 @@ def _write_status(
     dump_yaml(data, run_dir / "status.yaml")
 
 
+def _combined_figure_size(config: Mapping[str, Any]) -> list[float]:
+    configured = config.get("latent_dynamics_figure_size")
+    if configured is not None:
+        return [float(value) for value in configured]
+    single = config["vector_field_figure_size"]
+    return [2.0 * float(single[0]), float(single[1])]
+
+
 def _last_step_from_metrics(run_dir: Path) -> int | None:
     """Recover the last completed epoch from ``metrics.csv`` after a failure."""
     path = run_dir / "metrics.csv"
@@ -315,7 +404,6 @@ def _with_cli_overrides(
     epochs: int | None,
     batch_size: int | None,
     device: str | None,
-    tag: str | None = None,
 ) -> ResolvedExperiment:
     components = deepcopy(experiment.components)
     train = components.get("train")
@@ -326,14 +414,13 @@ def _with_cli_overrides(
             train["batch_size"] = batch_size
         if device is not None:
             train["device"] = device
-    resolved_tag = experiment.tag if tag is None else tag
     return ResolvedExperiment(
         name=experiment.name,
         seed=experiment.seed,
-        tag=resolved_tag,
         components=components,
         component_sources=deepcopy(experiment.component_sources),
         source=experiment.source,
+        identity_fields=deepcopy(experiment.identity_fields),
     )
 
 
@@ -344,10 +431,15 @@ def _require_components(experiment: ResolvedExperiment, *names: str) -> None:
 
 
 def _validate_cross_component_config(
-    model: Rank2CTRNNConfig, analysis: AnalysisConfig, train: TrainConfig
+    model: Rank2CTRNNConfig,
+    analysis: AnalysisConfig,
+    train: TrainConfig,
+    task_input_size: int,
 ) -> None:
-    if model.input_size != 3 or model.output_size != 1:
-        raise ValueError("Interval categorization requires input_size=3 and output_size=1")
+    if model.input_size != task_input_size or model.output_size != 1:
+        raise ValueError(
+            f"Task requires input_size={task_input_size} and output_size=1"
+        )
     if len(analysis.input_condition) != model.input_size:
         raise ValueError("Analysis input_condition must match model input_size")
     if any(epoch > train.epochs for epoch in analysis.representative_epochs):

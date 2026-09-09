@@ -1,0 +1,43 @@
+name: delayed_interval_reproduction
+
+# S1, S2, and Go are identical square pulses on one scalar input channel.
+stimulus:
+  waveform: square
+  encoding: shared
+  width: 1.0
+  amplitude: 1.0
+
+# Binary step target over a 2T production horizon after Go.
+target:
+  baseline: 0.0
+  response: 1.0
+loss:
+  name: phase_normalized_mse
+  phase_weights:
+    pre_go: 1.0
+    reproduction_wait: 1.0
+    response: 1.0
+evaluation:
+  response_threshold: 0.5
+  sustained_steps: 1
+sampling:
+  upper_bound: exclusive
+
+splits:
+  # Paper protocol: S1=50, T~U[30,100), T_delay~U[20,90).
+  train:
+    interval: [30.0, 100.0]
+    delay: [20.0, 90.0]
+    s1_onset: [50.0, 50.0]
+  validation:
+    interval: [30.0, 100.0]
+    delay: [20.0, 90.0]
+    s1_onset: [50.0, 50.0]
+  ood_short:
+    interval: [20.0, 30.0]
+    delay: [20.0, 90.0]
+    s1_onset: [50.0, 50.0]
+  ood_long:
+    interval: [100.0, 141.0]
+    delay: [20.0, 90.0]
+    s1_onset: [50.0, 50.0]

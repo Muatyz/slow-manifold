@@ -27,13 +27,14 @@ def plot_task_batch(
         raise ValueError("display_trials must be positive")
 
     figure, axes = plt.subplots(count, 1, figsize=tuple(figure_size), squeeze=False)
-    colors = ("tab:red", "tab:orange", "tab:green")
+    colors = ("tab:red", "tab:orange", "tab:green", "tab:purple")
     for index in range(count):
         axis = axes[index, 0]
         metadata = batch.metadata[index]
         length = metadata.trial_steps
         time = np.arange(length) * batch.dt
-        for channel, (name, color) in enumerate(zip(("S1", "S2", "Go"), colors)):
+        for channel, name in enumerate(batch.input_names):
+            color = colors[channel % len(colors)]
             axis.step(
                 time,
                 batch.inputs[index, :length, channel],
@@ -58,7 +59,12 @@ def plot_task_batch(
             label="loss mask",
         )
         axis.axvline(metadata.response_step * batch.dt, color="0.5", linestyle=":")
-        axis.set_ylabel(f"trial {index}\nclass {metadata.class_label:+d}")
+        trial_label = (
+            f"class {metadata.class_label:+d}"
+            if metadata.class_label is not None
+            else f"T={metadata.interval:g}"
+        )
+        axis.set_ylabel(f"trial {index}\n{trial_label}")
         axis.grid(alpha=0.2)
         if index == 0:
             axis.legend(loc="upper right", ncol=5)

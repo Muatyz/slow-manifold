@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     sanity_parser.add_argument(
         "--output-dir",
         type=Path,
-        help="override runs/<experiment.name>/<tag>-seed-<seed>",
+        help="override the config-derived run directory",
     )
 
     train_parser = subparsers.add_parser(
@@ -41,18 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--output-dir",
         type=Path,
-        help="override runs/<experiment.name>/<tag>-seed-<seed>",
+        help="override the config-derived run directory",
     )
     train_parser.add_argument("--epochs", type=int)
     train_parser.add_argument("--batch-size", type=int)
     train_parser.add_argument("--device", choices=("cpu", "cuda"))
-    train_parser.add_argument(
-        "--tag",
-        help=(
-            "run-directory tag separating otherwise identical recipes "
-            "(e.g. 'lr1e-4'); see --help of 'visualize' for re-rendering"
-        ),
-    )
 
     visualize_parser = subparsers.add_parser(
         "visualize",
@@ -113,7 +106,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             epochs=args.epochs,
             batch_size=args.batch_size,
             device=args.device,
-            tag=args.tag,
         )
         print(f"Training run written to: {run_dir}")
         return 0

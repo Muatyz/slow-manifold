@@ -1,5 +1,8 @@
 name: phase1_rank2_baseline
 seed: 20260903
+identity:
+  label_fields:
+    lr: train.optimizer.learning_rate
 
 components:
   task: ../configs/task/interval_categorization.yaml
@@ -7,10 +10,13 @@ components:
   train: ../configs/train/rank2_baseline.yaml
   analysis: ../configs/analysis/training_dynamics.yaml
   visualization: ../configs/visualization/training_dynamics.yaml
+  reporting: ../configs/reporting/training_startup.yaml
 
 overrides:
   train:
-    epochs: 20000
+    optimizer:
+      learning_rate: 1e-4
+    epochs: 200000
     batch_size: 64
   analysis:
-    representative_epochs: [0, 100, 500, 1000, 5000, 10000, 20000]
+    representative_epochs: [0, 100, 500, 1000, 5000, 10000, 20000, 100000, 200000]

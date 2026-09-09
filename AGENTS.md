@@ -64,7 +64,7 @@
 
 每个 run 维护统一的 `run.log`（人类可读事件时间线，含阶段耗时与训练进度）与 `status.yaml` 生命周期（`running` → `complete`/`failed`/`interrupted`）。异常与 Ctrl+C 中断必须把错误类型、最后完成的 epoch 与简要信息写入 `status.yaml`，完整 traceback 只写入 `run.log`；不得留下停在 `running` 的半成品 run 而无法判断其停止原因。
 
-同一 recipe 重复运行需用 `tag` 或不同 seed 区分 run 目录（`runs/<name>/<tag>-seed-<seed>`），禁止静默覆盖。可视化产物集中在 `figures/latent_vector_field/`；重绘不重训等 figure 布局与解耦规则见 SKILL §4。
+run 目录由 resolved `task/model/train` 的配置指纹和 seed 决定：`runs/<name>/<condition>--cfg-<fingerprint>/seed-<seed>`。`condition` 只能从真实配置字段派生，不得用与配置脱节的自由文本冒充实验条件；同配置、同 seed 禁止静默覆盖。联合动力学产物集中在 `figures/latent_dynamics/`；兼容性独立图保留在 `figures/latent_vector_field/` 与 `figures/latent_jacobian/`。重绘不重训等 figure 布局与解耦规则见 SKILL §4。
 
 ## 6. 保持科学表述严谨
 

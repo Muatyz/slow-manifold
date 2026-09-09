@@ -1,6 +1,6 @@
 # Rank-2 RNN Timing Dynamics：实施前研究计划
 
-> 状态（2026-09-03）：Phase 0 已完成。Phase 1 端到端工程管线已通过自动测试与 CUDA smoke test，包含 metrics、checkpoint 和三类 Dinc-style figures；正式 baseline 与 multi-seed 训练尚未开始。Phase 2/3 仅完成描述性 vector field 和跨 checkpoint 坐标对齐骨架，slow-point、Jacobian 与 ghost diagnostics 尚未实现。
+> 状态（2026-09-07）：Task A 已完成一个 seed 的正式 baseline；Task B（Interval Reproduction）已完成 generator、phase-normalized loss、行为指标与端到端 smoke pipeline，正式训练尚未开始。multi-seed、trajectory/global 初始化、eigenvectors 与 full-state ghost diagnostics 尚未完成。
 
 ## 1. 研究目标
 
@@ -70,6 +70,15 @@ Recurrent matrix：
 - 二维 `κ` 是模型的精确 latent coordinate，不是对 neural activity 做 PCA。
 - 初始化和尺度必须避免 `M/N` factorization 带来的数值失衡；监测两者范数及 `W` 的 singular values。
 
+### 3.3 Interval Reproduction（Task B）
+
+- 沿用同一个 rank-2/tanh CTRNN；S1、S2、Go 共用一个方波输入通道。
+- Go 后观察 `2T`：前 `T` 为 reproduction-wait，后 `T` target 为 1。
+- pre-Go、wait、response 的 MSE 分别按阶段时长归一化，再按配置权重相加并对 batch 平均。
+- 用首次持续阈值穿越报告 timing MAE/RMSE/bias、premature rate 与 no-response rate。
+- [x] task、loss、metrics、training/analysis/visualization 与重绘 smoke pipeline。
+- [ ] 正式训练与行为验收；minimum rank 和 tolerance accuracy 待观察结果后定义。
+
 ## 4. 分阶段工作与验收
 
 下列 `[x]` 表示对应实现已完成并通过自动测试或 smoke test；依赖正式实验结果的验收项，只有在实际运行并检查结果后才标记完成。
@@ -86,7 +95,8 @@ Recurrent matrix：
 ### Phase 1：训练 rank-2 baseline
 
 - [x] 通过公共 runner 跑通短程 CPU/CUDA smoke training，并生成完整 run 目录。
-- [ ] 用一个 seed 完成正式 baseline 训练，再建立小型 multi-seed cohort；单 seed 仅作工程验收。
+- [x] 用一个 seed 完成正式 baseline 训练；单 seed 仅作工程验收。
+- [ ] 建立小型 multi-seed cohort。
 - [x] 记录 train/validation loss、accuracy、gradient norm、learning rate、`‖M‖/‖N‖/‖W‖` 和两个 singular values。
 - [x] 保存 initial、periodic、best、final checkpoints，以及 model/optimizer/config/seed/metrics 和 RNG state。
 - [ ] checkpoint 频率足以解析潜在的快速行为跃迁。
@@ -103,10 +113,11 @@ Recurrent matrix：
 优先分析 autonomous `u=0`，再按需要比较 S1、S2 和 Go 条件，因为输入会重构 vector field。
 
 - [x] 在跨 checkpoint 对齐的二维网格评估 `F_κ` 与 normalized speed，并保存结构化 NPZ/YAML。
+- [x] 在同一网格解析计算 exact latent Jacobian，保存完整复特征值与 `max Re(λ)` spectral-abscissa map。
 - [x] 绘制初步 quiver、speed background 和 short/long task trajectories。
-- [ ] 显式计算并保存 `q_κ=1/2‖F_κ‖²`，统一后续优化与阈值定义。
+- [x] 对 refined minima 显式计算并保存 `q_κ=1/2‖F_κ‖²`，统一分类阈值定义。
 - [ ] 用 task-trajectory states 与 global/random points 分别初始化 `q_κ` minimization。
-- [ ] 搜索、聚类并分类 latent fixed points 和 latent slow points。
+- [x] 从八邻域网格候选初始化、连续优化、去重并分类 latent fixed/slow points 与 latent ghost candidates。
 - [ ] 保存位置、`q`、speed、初始化来源、优化状态、Jacobian、eigenvalues 和 eigenvectors。
 - [ ] 对 latent candidate 附近的 task-relevant full state 额外最小化 `q_x(x)=1/2‖F_x(x,u)‖²`。
 - [ ] 只有 full-state slow point 及完整 Jacobian 都支持 transverse stability 时，才标记为 ghost candidate。
@@ -123,6 +134,8 @@ rank-2 factorization 存在 `M→MA, N→NA^(-T)` 的 gauge freedom。跨 checkp
 - [ ] 增加近简并 singular values 的检测、告警与稳健性测试。
 - [x] 跨帧固定坐标范围、evaluation trials 和 speed color scale。
 - [x] 支持在 initial、配置指定的 intermediate 和 final checkpoints 生成 output panels 与初步 MP4。
+- [x] 在同一 snapshot/MP4 中同步展示 vector field 与 Jacobian spectral abscissa。
+- [x] 轨迹使用颜色编码任务条件、线型编码任务阶段，并在独立图与联合图中保持一致。
 - [x] 联合绘制 loss、validation loss 与 gradient norm，并标注代表性 epochs。
 - [ ] 在正式训练后定位 behavioral transition，并重复完整 Phase 2 diagnostics。
 - [ ] 联合比较 accuracy、`min(q)`、slow-region extent、local spectrum 和 residence time。

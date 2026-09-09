@@ -13,14 +13,16 @@ from slow_manifold.workflows import rerun_rank2_visualization, run_rank2_trainin
 
 ROOT = Path(__file__).parents[1]
 SMOKE = ROOT / "tests" / "fixtures" / "phase1_smoke.yaml"
+REPRODUCTION_SMOKE = ROOT / "experiments" / "phase1_rank2_IR_smoke.yaml"
 
 
 def test_short_training_run_writes_reproducible_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    expected_run_dir = resolve_experiment(SMOKE).default_run_dir()
     run_dir = run_rank2_training(SMOKE)
-    assert run_dir == (tmp_path / "runs" / "phase1_smoke" / "seed-17").resolve()
+    assert run_dir == expected_run_dir
 
     expected = (
         "config.yaml",
@@ -40,6 +42,11 @@ def test_short_training_run_writes_reproducible_diagnostics(
         "figures/latent_vector_field/latent_vector_field.mp4",
         "figures/latent_vector_field/epoch-000000.png",
         "figures/latent_vector_field/epoch-000001.png",
+        "figures/latent_jacobian/epoch-000000.png",
+        "figures/latent_jacobian/epoch-000001.png",
+        "figures/latent_dynamics/latent_dynamics.mp4",
+        "figures/latent_dynamics/epoch-000000.png",
+        "figures/latent_dynamics/epoch-000001.png",
     )
     for relative_path in expected:
         assert (run_dir / relative_path).is_file(), relative_path
@@ -71,14 +78,31 @@ def test_short_training_run_writes_reproducible_diagnostics(
     assert "finished_at_utc" in status
     assert status["elapsed_seconds"] >= 0
 
+    experiment = resolve_experiment(SMOKE)
+    with (run_dir / "config.yaml").open(encoding="utf-8") as stream:
+        saved_config = yaml.safe_load(stream)
+    assert saved_config["run"]["condition_label"] == "lr-1e-3"
+    assert (
+        saved_config["run"]["condition_fingerprint"]
+        == experiment.condition_fingerprint
+    )
+    with (run_dir / "metadata.yaml").open(encoding="utf-8") as stream:
+        metadata = yaml.safe_load(stream)
+    assert metadata["condition_fingerprint"] == experiment.condition_fingerprint
+
     run_log = (run_dir / "run.log").read_text(encoding="utf-8")
     for expected_fragment in (
         "run started",
+        "configuration Task: Interval Categorization",
+        "configuration Model: Vanilla RNN | N=8",
+        "configuration Train: optimizer=adam | learning rate=0.001",
         "training started",
         "step=1",
         "training complete",
         "latent analysis complete",
         "vector field artifacts written",
+        "latent Jacobian artifacts written",
+        "combined latent dynamics artifacts written",
         "run complete",
     ):
         assert expected_fragment in run_log, expected_fragment
@@ -92,11 +116,46 @@ def test_short_training_run_writes_reproducible_diagnostics(
         assert data["epochs"].tolist() == [0, 1]
         assert data["flow"].shape == (2, 7, 7, 2)
         assert data["speed_minimum_mask"].shape == (2, 7, 7)
+        assert data["jacobian_eigenvalues"].shape == (2, 7, 7, 2)
+        assert data["jacobian_spectral_abscissa"].shape == (2, 7, 7)
+        assert np.isfinite(data["jacobian_eigenvalues"]).all()
+        np.testing.assert_allclose(
+            data["jacobian_spectral_abscissa"],
+            data["jacobian_eigenvalues"].real.max(axis=-1),
+        )
+        candidate_count = data["speed_minimum_coordinates"].shape[0]
+        assert data["speed_minimum_epoch_index"].shape == (candidate_count,)
+        assert data["speed_minimum_eigenvalues"].shape == (candidate_count, 2)
+        assert data["speed_minimum_q_hessian_eigenvalues"].shape == (
+            candidate_count,
+            2,
+        )
+        assert set(data["speed_minimum_classification"].tolist()) <= {
+            "fixed_point",
+            "slow_point",
+            "latent_ghost_candidate",
+            "unresolved",
+        }
         assert data["basis"].shape == (2, 8, 2)
+        for field in (
+            "trial_s1_step",
+            "trial_s2_step",
+            "trial_go_step",
+            "trial_response_step",
+            "trial_steps",
+        ):
+            assert data[field].shape == (2,)
+        assert np.all(data["trial_s1_step"] < data["trial_s2_step"])
+        assert np.all(data["trial_s2_step"] < data["trial_go_step"])
+        assert np.all(data["trial_go_step"] < data["trial_response_step"])
         final_basis = torch.as_tensor(data["basis"][-1])
         torch.testing.assert_close(final_basis.T @ final_basis, torch.eye(2))
+    with (run_dir / "diagnostics" / "latent_dynamics.yaml").open(
+        encoding="utf-8"
+    ) as stream:
+        diagnostics_metadata = yaml.safe_load(stream)
+    assert diagnostics_metadata["grid_points"] == 7
 
-    experiment = resolve_experiment(SMOKE)
     model_config = Rank2CTRNNConfig.from_mapping(experiment.components["model"])
     restored = Rank2CTRNN(model_config)
     restored.load_state_dict(payload["model_state"])
@@ -131,38 +190,25 @@ def test_training_run_refuses_to_overwrite(tmp_path: Path) -> None:
         run_rank2_training(SMOKE, output_dir)
 
 
-def test_run_tag_separates_run_directories(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Learning-rate-style scans share a recipe but must not collide on disk."""
-    monkeypatch.chdir(tmp_path)
-    untagged = run_rank2_training(SMOKE)
-    tagged = run_rank2_training(SMOKE, tag="lr1e-4")
-
-    assert untagged == (tmp_path / "runs" / "phase1_smoke" / "seed-17").resolve()
-    assert tagged == (
-        tmp_path / "runs" / "phase1_smoke" / "lr1e-4-seed-17"
-    ).resolve()
-    assert tagged != untagged
-
-    with (tagged / "config.yaml").open(encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-    assert config["tag"] == "lr1e-4"
-
-
-def test_recipe_tag_is_resolved(tmp_path: Path) -> None:
-    recipe = yaml.safe_load(SMOKE.read_text(encoding="utf-8"))
-    recipe["tag"] = "lr1e-3"
-    tagged_path = tmp_path / "tagged.yaml"
-    tagged_path.write_text(
-        yaml.safe_dump(recipe, sort_keys=False), encoding="utf-8"
-    )
-
-    experiment = resolve_experiment(tagged_path)
-    assert experiment.tag == "lr1e-3"
-    assert experiment.default_run_dir(tmp_path / "runs") == (
-        tmp_path / "runs" / "phase1_smoke" / "lr1e-3-seed-17"
-    ).resolve()
+def test_reproduction_training_pipeline_reports_timing_metrics(tmp_path: Path) -> None:
+    run_dir = run_rank2_training(REPRODUCTION_SMOKE, tmp_path / "reproduction")
+    with (run_dir / "metrics.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    for field in (
+        "validation_timing_mae",
+        "validation_timing_rmse",
+        "validation_timing_bias",
+        "validation_premature_rate",
+        "validation_no_response_rate",
+    ):
+        assert field in rows[-1]
+    with np.load(run_dir / "diagnostics" / "latent_dynamics.npz") as data:
+        assert data["task_name"].item() == "delayed_interval_reproduction"
+        assert data["trajectory"].shape[1] == 3
+        assert data["trajectory"].shape[-1] == 2
+    assert (run_dir / "figures/representative_outputs.png").is_file()
+    assert (run_dir / "figures/latent_vector_field/latent_vector_field.mp4").is_file()
+    assert (run_dir / "figures/latent_dynamics/latent_dynamics.mp4").is_file()
 
 
 @pytest.mark.parametrize(
@@ -190,7 +236,7 @@ def test_run_failure_records_status_and_traceback(
     with pytest.raises(type(exception), match="synthetic"):
         workflow.run_rank2_training(SMOKE)
 
-    run_dir = tmp_path / "runs" / "phase1_smoke" / "seed-17"
+    run_dir = resolve_experiment(SMOKE).default_run_dir()
     with (run_dir / "status.yaml").open(encoding="utf-8") as stream:
         status = yaml.safe_load(stream)
     assert status["status"] == expected_status
@@ -227,6 +273,11 @@ def test_visualize_rerun_from_existing_run(
         "latent_vector_field/latent_vector_field.mp4",
         "latent_vector_field/epoch-000000.png",
         "latent_vector_field/epoch-000001.png",
+        "latent_jacobian/epoch-000000.png",
+        "latent_jacobian/epoch-000001.png",
+        "latent_dynamics/latent_dynamics.mp4",
+        "latent_dynamics/epoch-000000.png",
+        "latent_dynamics/epoch-000001.png",
     ):
         assert (figures_dir / relative_path).is_file(), relative_path
     log = (run_dir / "run.log").read_text(encoding="utf-8")
@@ -242,6 +293,31 @@ def test_visualize_rerun_from_existing_run(
         marker = yaml.safe_load(stream)
     assert marker["overrides"] == {"arrow_stride": 1}
     assert original_log.count("visualization rerun") == 0
+
+
+def test_visualize_rerun_upgrades_diagnostics_without_jacobian(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy runs gain Jacobian fields from their stored checkpoints."""
+    monkeypatch.chdir(tmp_path)
+    run_dir = run_rank2_training(SMOKE)
+    data_path = run_dir / "diagnostics" / "latent_dynamics.npz"
+    with np.load(data_path) as data:
+        legacy = {
+            name: data[name]
+            for name in data.files
+            if name
+            not in {"jacobian_eigenvalues", "jacobian_spectral_abscissa"}
+        }
+    np.savez_compressed(data_path, **legacy)
+
+    rerun_rank2_visualization(run_dir)
+
+    with np.load(data_path) as data:
+        assert "jacobian_eigenvalues" in data.files
+        assert "jacobian_spectral_abscissa" in data.files
+    assert (run_dir / "figures/latent_jacobian/epoch-000001.png").is_file()
+    assert (run_dir / "figures/latent_dynamics/epoch-000001.png").is_file()
 
 
 def test_visualize_rerun_recomputes_with_analysis_overrides(

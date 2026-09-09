@@ -21,14 +21,13 @@ import numpy as np
 from slow_manifold.analysis import AnalysisConfig, analyze_checkpoints
 from slow_manifold.config import dump_yaml, load_yaml
 from slow_manifold.models import Rank2CTRNNConfig
-from slow_manifold.tasks import (
-    IntervalCategorizationConfig,
-    IntervalCategorizationTask,
-)
+from slow_manifold.tasks import create_task
 from slow_manifold.utils import get_logger, setup_run_logging
 from slow_manifold.visualization import (
     plot_representative_outputs,
     plot_training_curves,
+    render_latent_dynamics_collection,
+    render_latent_jacobian_collection,
     render_latent_vector_field_collection,
 )
 
@@ -69,8 +68,9 @@ def rerun_rank2_visualization(
 
     resolved = load_yaml(config_path)
     model_config = Rank2CTRNNConfig.from_mapping(resolved["components"]["model"])
-    task_config = IntervalCategorizationConfig.from_mapping(
-        resolved["components"]["task"], dt=model_config.dt
+    task_mapping = resolved["components"]["task"]
+    response_threshold = float(
+        task_mapping.get("evaluation", {}).get("response_threshold", 0.5)
     )
     analysis_mapping = deepcopy(resolved["components"]["analysis"])
     visualization_mapping = deepcopy(resolved["components"]["visualization"])
@@ -84,10 +84,14 @@ def rerun_rank2_visualization(
     if arrow_stride is not None:
         visualization_mapping["arrow_stride"] = arrow_stride
         applied_overrides["arrow_stride"] = arrow_stride
+    if representative_epochs is not None:
+        applied_overrides["representative_epochs"] = [
+            int(epoch) for epoch in representative_epochs
+        ]
     analysis_config = AnalysisConfig.from_mapping(analysis_mapping)
 
     recompute = (
-        not data_path.is_file()
+        _diagnostics_require_recompute(data_path)
         or coordinate_bounds is not None
         or grid_points is not None
     )
@@ -98,7 +102,9 @@ def rerun_rank2_visualization(
                 "Recompute requested but no epoch-*.pt checkpoints are stored "
                 f"in {run_path / 'checkpoints'}"
             )
-        validation_task = IntervalCategorizationTask(task_config, split="validation")
+        validation_task = create_task(
+            task_mapping, dt=model_config.dt, split="validation"
+        )
         result = analyze_checkpoints(
             checkpoint_paths=checkpoint_paths,
             model_config=model_config,
@@ -148,6 +154,7 @@ def rerun_rank2_visualization(
         decision_band_logit_half_width=float(
             visualization_mapping.get("decision_band_logit_half_width", 1.0)
         ),
+        response_threshold=response_threshold,
     )
     logger.info(
         "figure written file=representative_outputs.png elapsed_seconds=%.2fs",
@@ -164,14 +171,66 @@ def rerun_rank2_visualization(
         fps=int(visualization_mapping["movie_fps"]),
         codec=str(visualization_mapping["movie_codec"]),
         arrow_stride=int(visualization_mapping["arrow_stride"]),
+        arrow_color=str(visualization_mapping.get("arrow_color", "black")),
+        arrow_length_fraction=float(
+            visualization_mapping.get("arrow_length_fraction", 0.012)
+        ),
+        arrow_width=float(visualization_mapping.get("arrow_width", 0.002)),
         decision_band_logit_half_width=float(
             visualization_mapping.get("decision_band_logit_half_width", 1.0)
         ),
+        response_threshold=response_threshold,
     )
     logger.info(
         "vector field artifacts written snapshots=%d movie=latent_vector_field.mp4 "
         "elapsed_seconds=%.2fs",
         len(vector_fields["snapshots"]),
+        time.perf_counter() - started_figures,
+    )
+    started_figures = time.perf_counter()
+    jacobian_snapshots = render_latent_jacobian_collection(
+        data_path,
+        figures_dir / "latent_jacobian",
+        representative_epochs=representatives,
+        figure_size=visualization_mapping["vector_field_figure_size"],
+        dpi=int(visualization_mapping["vector_field_dpi"]),
+        spectral_abscissa_limit=visualization_mapping.get(
+            "jacobian_spectral_abscissa_limit"
+        ),
+    )
+    logger.info(
+        "latent Jacobian artifacts written snapshots=%d elapsed_seconds=%.2fs",
+        len(jacobian_snapshots),
+        time.perf_counter() - started_figures,
+    )
+    started_figures = time.perf_counter()
+    combined = render_latent_dynamics_collection(
+        data_path,
+        figures_dir / "latent_dynamics",
+        representative_epochs=representatives,
+        speed_floor=analysis_config.speed_floor,
+        figure_size=_combined_figure_size(visualization_mapping),
+        dpi=int(visualization_mapping["vector_field_dpi"]),
+        fps=int(visualization_mapping["movie_fps"]),
+        codec=str(visualization_mapping["movie_codec"]),
+        arrow_stride=int(visualization_mapping["arrow_stride"]),
+        arrow_color=str(visualization_mapping.get("arrow_color", "black")),
+        arrow_length_fraction=float(
+            visualization_mapping.get("arrow_length_fraction", 0.012)
+        ),
+        arrow_width=float(visualization_mapping.get("arrow_width", 0.002)),
+        decision_band_logit_half_width=float(
+            visualization_mapping.get("decision_band_logit_half_width", 1.0)
+        ),
+        response_threshold=response_threshold,
+        spectral_abscissa_limit=visualization_mapping.get(
+            "jacobian_spectral_abscissa_limit"
+        ),
+    )
+    logger.info(
+        "combined latent dynamics artifacts written snapshots=%d "
+        "movie=latent_dynamics.mp4 elapsed_seconds=%.2fs",
+        len(combined["snapshots"]),
         time.perf_counter() - started_figures,
     )
 
@@ -183,6 +242,32 @@ def rerun_rank2_visualization(
         figures_dir,
     )
     return figures_dir
+
+
+def _diagnostics_require_recompute(data_path: Path) -> bool:
+    """Upgrade legacy diagnostics that predate the latent Jacobian fields."""
+    if not data_path.is_file():
+        return True
+    with np.load(data_path) as data:
+        return not {
+            "jacobian_eigenvalues",
+            "jacobian_spectral_abscissa",
+            "speed_minimum_coordinates",
+            "speed_minimum_classification",
+            "trial_s1_step",
+            "trial_s2_step",
+            "trial_go_step",
+            "trial_response_step",
+            "trial_steps",
+        }.issubset(data.files)
+
+
+def _combined_figure_size(config: Mapping[str, Any]) -> list[float]:
+    configured = config.get("latent_dynamics_figure_size")
+    if configured is not None:
+        return [float(value) for value in configured]
+    single = config["vector_field_figure_size"]
+    return [2.0 * float(single[0]), float(single[1])]
 
 
 def _epoch_checkpoint_paths(run_dir: Path) -> dict[int, Path]:

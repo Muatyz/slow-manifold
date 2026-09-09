@@ -1,0 +1,38 @@
+name: phase1_rank2_IR_smoke
+seed: 20260903
+identity:
+  label_fields:
+    lr: train.optimizer.learning_rate
+
+components:
+  task: ../configs/task/interval_reproduction.yaml
+  model: ../configs/model/rank2_ctrnn.yaml
+  train: ../configs/train/rank2_baseline.yaml
+  analysis: ../configs/analysis/training_dynamics.yaml
+  visualization: ../configs/visualization/training_dynamics.yaml
+  reporting: ../configs/reporting/reproduction_startup.yaml
+
+overrides:
+  model:
+    input_size: 1
+    tau: 10.0
+    dt: 1.0
+  train:
+    device: cpu
+    epochs: 2
+    batch_size: 4
+    validation_batch_size: 8
+    log_every: 1
+    checkpoint:
+      every: 1
+  analysis:
+    input_condition: [0.0]
+    representative_epochs: [0, 1, 2]
+    evaluation_trials:
+      - {interval: 30.0, delay: 55.0, s1_onset: 50.0}
+      - {interval: 65.0, delay: 55.0, s1_onset: 50.0}
+      - {interval: 99.0, delay: 55.0, s1_onset: 50.0}
+    grid_points: 11
+  visualization:
+    vector_field_dpi: 60
+    movie_fps: 2

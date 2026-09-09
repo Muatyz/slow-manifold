@@ -15,7 +15,7 @@ import torch
 from torch import Tensor
 
 from slow_manifold.models import Rank2CTRNN
-from slow_manifold.tasks import IntervalCategorizationTask, TaskBatch
+from slow_manifold.tasks import ConfiguredTask, TaskBatch
 from slow_manifold.training.checkpoint import save_checkpoint
 from slow_manifold.utils.logging import get_logger
 
@@ -76,12 +76,10 @@ class TrainConfig:
             raise TrainConfigError("CUDA was requested but is not available")
         if self.epochs <= 0 or self.log_every <= 0 or self.checkpoint_every <= 0:
             raise TrainConfigError("epochs and frequencies must be positive")
-        if self.batch_size <= 0 or self.batch_size % 2:
-            raise TrainConfigError("batch_size must be a positive even integer")
-        if self.validation_batch_size <= 0 or self.validation_batch_size % 2:
-            raise TrainConfigError(
-                "validation_batch_size must be a positive even integer"
-            )
+        if self.batch_size <= 0:
+            raise TrainConfigError("batch_size must be positive")
+        if self.validation_batch_size <= 0:
+            raise TrainConfigError("validation_batch_size must be positive")
         if self.optimizer_name != "adam":
             raise TrainConfigError("Only the Adam optimizer is supported")
         if self.learning_rate <= 0 or self.weight_decay < 0:
@@ -104,7 +102,7 @@ class TrainingResult:
 def train_model(
     *,
     model: Rank2CTRNN,
-    train_task: IntervalCategorizationTask,
+    train_task: ConfiguredTask,
     validation_batch: TaskBatch,
     train_rng: np.random.Generator,
     config: TrainConfig,
@@ -162,6 +160,7 @@ def train_model(
             clip_norm=config.gradient_clip_norm,
             epoch=epoch,
             device=device,
+            task=train_task,
         )
         duration = time.perf_counter() - start
         elapsed_seconds += duration
@@ -239,13 +238,18 @@ def train_model(
                 time.perf_counter() - start,
             )
         if epoch % config.log_every == 0 or epoch == config.epochs:
+            behavior = " ".join(
+                f"{key.removeprefix('validation_')}={value:.3g}"
+                for key, value in row.items()
+                if key.startswith("validation_") and key != "validation_loss"
+            )
             logger.info(
-                "step=%d train_loss=%.6g validation_loss=%.6g accuracy=%.3f "
+                "step=%d train_loss=%.6g validation_loss=%.6g %s "
                 "epoch_seconds=%.2fs elapsed=%.1fs eta=%s",
                 epoch,
                 row["train_loss"],
                 row["validation_loss"],
-                row["validation_accuracy"],
+                behavior,
                 row["epoch_seconds"],
                 row["elapsed_seconds"],
                 _format_duration(
@@ -294,12 +298,19 @@ def _measure_step(
     clip_norm: float | None,
     epoch: int,
     device: torch.device,
+    task: ConfiguredTask,
 ) -> dict[str, float | int]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     train = _torch_batch(batch, device, model.config.torch_dtype)
     prediction, _, _ = model.rollout(train["inputs"])
-    train_loss = _masked_mse(prediction, train["target"], train["loss_mask"])
+    train_loss = _masked_mse(
+        prediction,
+        train["target"],
+        train["loss_mask"],
+        reduction=batch.loss_reduction,
+        batch_size=batch.inputs.shape[0],
+    )
     train_loss.backward()
     recurrent_gradient_norm = _recurrent_gradient_norm(model)
     total_gradient_norm = _total_gradient_norm(model)
@@ -315,10 +326,14 @@ def _measure_step(
         )
         validation_prediction, _, _ = model.rollout(validation["inputs"])
         validation_loss = _masked_mse(
-            validation_prediction, validation["target"], validation["loss_mask"]
+            validation_prediction,
+            validation["target"],
+            validation["loss_mask"],
+            reduction=validation_batch.loss_reduction,
+            batch_size=validation_batch.inputs.shape[0],
         )
-        validation_accuracy = _response_accuracy(
-            validation_prediction, validation["target"]
+        behavior_metrics = task.evaluate_prediction(
+            validation_prediction.detach().cpu().numpy(), validation_batch
         )
         parameter_diagnostics = _parameter_diagnostics(model)
     return {
@@ -326,7 +341,7 @@ def _measure_step(
         "learning_rate": float(optimizer.param_groups[0]["lr"]),
         "train_loss": float(train_loss.detach().cpu()),
         "validation_loss": float(validation_loss.cpu()),
-        "validation_accuracy": float(validation_accuracy.cpu()),
+        **behavior_metrics,
         "recurrent_gradient_norm": recurrent_gradient_norm,
         "total_gradient_norm": total_gradient_norm,
         **parameter_diagnostics,
@@ -343,8 +358,20 @@ def _torch_batch(
     }
 
 
-def _masked_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    return torch.sum(mask * (prediction - target).square()) / torch.sum(mask)
+def _masked_mse(
+    prediction: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    reduction: str = "weighted_mean",
+    batch_size: int | None = None,
+) -> Tensor:
+    weighted_error = torch.sum(mask * (prediction - target).square())
+    if reduction == "weighted_mean":
+        return weighted_error / torch.sum(mask)
+    if reduction == "batch_mean" and batch_size is not None and batch_size > 0:
+        return weighted_error / batch_size
+    raise ValueError(f"Unsupported loss reduction: {reduction!r}")
 
 
 def _response_accuracy(prediction: Tensor, target: Tensor) -> Tensor:
