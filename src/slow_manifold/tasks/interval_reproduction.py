@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ._shared import (
+    PhaseNormalizedLossConfig,
+    SquarePulseStimulusConfig,
     TaskBatch,
     TaskConfigError,
     Trial,
@@ -35,16 +37,9 @@ class IntervalReproductionConfig:
 
     name: str
     dt: float
-    stimulus_waveform: str
-    stimulus_encoding: str
-    stimulus_width: float
-    stimulus_amplitude: float
+    stimulus: SquarePulseStimulusConfig
     target_baseline: float
     target_response: float
-    loss_name: str
-    pre_go_loss_weight: float
-    reproduction_wait_loss_weight: float
-    response_loss_weight: float
     response_threshold: float
     sustained_steps: int
     sampling_upper_bound: str
@@ -57,7 +52,6 @@ class IntervalReproductionConfig:
         try:
             stimulus = data["stimulus"]
             target = data["target"]
-            loss = data["loss"]
             evaluation = data["evaluation"]
             sampling = data["sampling"]
             raw_splits = data["splits"]
@@ -65,10 +59,10 @@ class IntervalReproductionConfig:
             raise TaskConfigError(f"Missing task field: {error.args[0]}") from error
         if not all(
             isinstance(item, Mapping)
-            for item in (stimulus, target, loss, evaluation, sampling, raw_splits)
+            for item in (stimulus, target, evaluation, sampling, raw_splits)
         ):
             raise TaskConfigError(
-                "stimulus, target, loss, evaluation, sampling, and splits "
+                "stimulus, target, evaluation, sampling, and splits "
                 "must be mappings"
             )
         if not raw_splits:
@@ -93,18 +87,11 @@ class IntervalReproductionConfig:
             config = cls(
                 name=str(data["name"]),
                 dt=float(dt),
-                stimulus_waveform=str(stimulus["waveform"]),
-                stimulus_encoding=str(stimulus["encoding"]),
-                stimulus_width=float(stimulus["width"]),
-                stimulus_amplitude=float(stimulus["amplitude"]),
+                stimulus=SquarePulseStimulusConfig.from_mapping(
+                    stimulus, dt=dt
+                ),
                 target_baseline=float(target["baseline"]),
                 target_response=float(target["response"]),
-                loss_name=str(loss["name"]),
-                pre_go_loss_weight=float(loss["phase_weights"]["pre_go"]),
-                reproduction_wait_loss_weight=float(
-                    loss["phase_weights"]["reproduction_wait"]
-                ),
-                response_loss_weight=float(loss["phase_weights"]["response"]),
                 response_threshold=float(evaluation["response_threshold"]),
                 sustained_steps=int(evaluation["sustained_steps"]),
                 sampling_upper_bound=str(sampling["upper_bound"]),
@@ -120,39 +107,16 @@ class IntervalReproductionConfig:
             raise TaskConfigError("name must not be empty")
         if self.dt <= 0:
             raise TaskConfigError("dt must be positive")
-        if self.stimulus_waveform != "square":
-            raise TaskConfigError("Only the 'square' stimulus waveform is supported")
-        if self.stimulus_encoding != "shared":
-            raise TaskConfigError("Interval reproduction requires shared cue encoding")
         if self.sampling_upper_bound != "exclusive":
             raise TaskConfigError("Only exclusive sampling upper bounds are supported")
-        if self.stimulus_amplitude <= 0:
-            raise TaskConfigError("stimulus amplitude must be positive")
         if self.target_baseline == self.target_response:
             raise TaskConfigError("target baseline and response must differ")
-        if self.loss_name != "phase_normalized_mse":
-            raise TaskConfigError("Only phase_normalized_mse is supported")
-        if min(
-            self.pre_go_loss_weight,
-            self.reproduction_wait_loss_weight,
-            self.response_loss_weight,
-        ) < 0:
-            raise TaskConfigError("phase loss weights must be non-negative")
-        if not any(
-            weight > 0
-            for weight in (
-                self.pre_go_loss_weight,
-                self.reproduction_wait_loss_weight,
-                self.response_loss_weight,
-            )
-        ):
-            raise TaskConfigError("at least one phase loss weight must be positive")
         if not self.target_baseline < self.response_threshold < self.target_response:
             raise TaskConfigError("response_threshold must lie between target levels")
         if self.sustained_steps <= 0:
             raise TaskConfigError("sustained_steps must be positive")
 
-        to_steps(self.stimulus_width, self.dt, "stimulus.width")
+        self.stimulus.validate(self.dt)
         for split_name, split in self.splits.items():
             for field_name in ("interval", "delay"):
                 low, high = getattr(split, field_name)
@@ -179,7 +143,7 @@ class IntervalReproductionConfig:
                 f"{split_name}.s1_onset[1]",
                 allow_zero=True,
             )
-            if self.stimulus_width > min(split.interval[0], split.delay[0]):
+            if self.stimulus.width > min(split.interval[0], split.delay[0]):
                 raise TaskConfigError(
                     f"stimulus.width causes overlapping cues in split '{split_name}'"
                 )
@@ -188,15 +152,28 @@ class IntervalReproductionConfig:
 class IntervalReproductionTask:
     """Generate delayed interval-reproduction trials with one shared cue input."""
 
-    input_names = ("cue",)
-
-    def __init__(self, config: IntervalReproductionConfig, split: str = "train"):
+    def __init__(
+        self,
+        config: IntervalReproductionConfig,
+        split: str = "train",
+        loss: PhaseNormalizedLossConfig | None = None,
+    ):
         if split not in config.splits:
             available = ", ".join(sorted(config.splits))
             raise TaskConfigError(f"Unknown split '{split}'. Available: {available}")
         self.config = config
         self.split_name = split
         self.split = config.splits[split]
+        self.loss = loss or PhaseNormalizedLossConfig.unit_weights(
+            "pre_go", "reproduction_wait", "response"
+        )
+        self.loss_weights = self.loss.require_phases(
+            "pre_go", "reproduction_wait", "response"
+        )
+
+    @property
+    def input_names(self) -> tuple[str, ...]:
+        return self.config.stimulus.input_names
 
     def build_trial(self, *, interval: float, delay: float, s1_onset: float) -> Trial:
         """Build one trial; response onset is measured from Go onset."""
@@ -204,7 +181,7 @@ class IntervalReproductionTask:
         interval_steps = to_steps(interval, cfg.dt, "interval")
         delay_steps = to_steps(delay, cfg.dt, "delay")
         s1_step = to_steps(s1_onset, cfg.dt, "s1_onset", allow_zero=True)
-        stimulus_steps = to_steps(cfg.stimulus_width, cfg.dt, "stimulus.width")
+        stimulus_steps = to_steps(cfg.stimulus.width, cfg.dt, "stimulus.width")
         if stimulus_steps > min(interval_steps, delay_steps):
             raise TaskConfigError("stimulus.width causes overlapping cues")
 
@@ -215,21 +192,23 @@ class IntervalReproductionTask:
         # response phase of the same duration.
         trial_steps = go_step + 2 * interval_steps
 
-        inputs = np.zeros((trial_steps, 1), dtype=np.float64)
+        inputs = cfg.stimulus.render(
+            cue_steps=(s1_step, s2_step, go_step),
+            trial_steps=trial_steps,
+            dt=cfg.dt,
+        )
         target = np.full(
             (trial_steps, 1), cfg.target_baseline, dtype=np.float64
         )
         loss_mask = np.zeros((trial_steps, 1), dtype=np.float64)
-        for cue_step in (s1_step, s2_step, go_step):
-            inputs[cue_step : cue_step + stimulus_steps, 0] = cfg.stimulus_amplitude
         target[response_step:, 0] = cfg.target_response
         # Each phase contributes its configured weight independent of duration.
-        loss_mask[:go_step, 0] = cfg.pre_go_loss_weight / go_step
+        loss_mask[:go_step, 0] = self.loss_weights["pre_go"] / go_step
         loss_mask[go_step:response_step, 0] = (
-            cfg.reproduction_wait_loss_weight / interval_steps
+            self.loss_weights["reproduction_wait"] / interval_steps
         )
         loss_mask[response_step:trial_steps, 0] = (
-            cfg.response_loss_weight / interval_steps
+            self.loss_weights["response"] / interval_steps
         )
 
         metadata = TrialMetadata(
@@ -264,7 +243,10 @@ class IntervalReproductionTask:
             raise ValueError("trials must not be empty")
         batch_size = len(trials)
         max_steps = max(trial.metadata.trial_steps for trial in trials)
-        inputs = np.zeros((batch_size, max_steps, 1), dtype=np.float64)
+        inputs = np.zeros(
+            (batch_size, max_steps, self.config.stimulus.input_size),
+            dtype=np.float64,
+        )
         target = np.zeros((batch_size, max_steps, 1), dtype=np.float64)
         loss_mask = np.zeros((batch_size, max_steps, 1), dtype=np.float64)
         valid_mask = np.zeros((batch_size, max_steps), dtype=np.bool_)

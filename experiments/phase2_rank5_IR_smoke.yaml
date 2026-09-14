@@ -1,7 +1,8 @@
-name: phase1_rank2_IR
-seed: 20260903
+name: phase2_rank5_IR_smoke
+seed: 20260914
 identity:
   label_fields:
+    rank: model.rank
     lr: train.optimizer.learning_rate
 
 components:
@@ -13,21 +14,43 @@ components:
   reporting: ../configs/reporting/reproduction_startup.yaml
 
 overrides:
+  model:
+    state_size: 12
+    rank: 5
+    tau: 10.0
+    dt: 1.0
   train:
-    epochs: 400000
-    optimizer:
-      learning_rate: 1e-4
+    device: cpu
+    epochs: 1
+    batch_size: 4
+    validation_batch_size: 8
+    log_every: 1
+    checkpoint:
+      every: 1
     loss:
       phase_weights:
         - {phase: pre_go, lambda: 1.0}
         - {phase: reproduction_wait, lambda: 1.0}
         - {phase: response, lambda: 1.0}
-  model:
-    tau: 10.0
-    dt: 1.0
   analysis:
+    representative_selection:
+      mode: manual
+      manual_epochs: [0, 1]
     evaluation_trials:
       - {interval: 30.0, delay: 55.0, s1_onset: 50.0}
       - {interval: 50.0, delay: 55.0, s1_onset: 50.0}
       - {interval: 75.0, delay: 55.0, s1_onset: 50.0}
       - {interval: 99.0, delay: 55.0, s1_onset: 50.0}
+    trajectory_count: 8
+    neighborhood_sampling:
+      anchor_count: 8
+      samples_per_anchor: 2
+      max_plot_points: 24
+  visualization:
+    training_curves_figure_size: [6.0, 4.0]
+    outputs_panel_width: 3.0
+    outputs_panel_height: 2.0
+    latent_dynamics_3d_figure_size: [15.0, 5.0]
+    snapshot_dpi: 200
+    movie_dpi: 100
+    max_3d_trajectories: 8

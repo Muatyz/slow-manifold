@@ -11,7 +11,7 @@ from torch import Tensor, nn
 
 
 class ModelConfigError(ValueError):
-    """Raised when the rank-2 CTRNN configuration is invalid."""
+    """Raised when the low-rank CTRNN configuration is invalid."""
 
 
 @dataclass(frozen=True)
@@ -59,8 +59,8 @@ class Rank2CTRNNConfig:
             raise ModelConfigError("Only tanh activation is supported")
         if raw.get("integrator") != "euler":
             raise ModelConfigError("Only Euler integration is supported")
-        if self.rank != 2:
-            raise ModelConfigError("This model requires rank=2")
+        if self.rank < 2:
+            raise ModelConfigError("supported low-rank models require rank >= 2")
         if min(self.input_size, self.state_size, self.output_size) <= 0:
             raise ModelConfigError("Model dimensions must be positive")
         if self.rank > self.state_size:
@@ -84,7 +84,12 @@ class Rank2CTRNNConfig:
 
 
 class Rank2CTRNN(nn.Module):
-    """Vanilla CTRNN with recurrent matrix ``W = M N^T`` and latent readout."""
+    """Vanilla rank-K CTRNN with ``W = M N^T`` and an exact K-D latent flow.
+
+    The historical class name is retained as a compatibility alias for stored
+    checkpoints and public imports; ``config.rank`` is no longer restricted to
+    two.
+    """
 
     def __init__(
         self, config: Rank2CTRNNConfig, *, generator: torch.Generator | None = None
@@ -129,15 +134,37 @@ class Rank2CTRNN(nn.Module):
     def latent(self, state: Tensor) -> Tensor:
         return state @ self.n
 
-    def flow(self, state: Tensor, inputs: Tensor) -> Tensor:
+    def flow(
+        self,
+        state: Tensor,
+        inputs: Tensor,
+        *,
+        neural_noise: Tensor | None = None,
+    ) -> Tensor:
         kappa = self.latent(state)
         drive = kappa @ self.m.T + inputs @ self.input_weight.T + self.bias
+        if neural_noise is not None:
+            if neural_noise.shape != state.shape:
+                raise ValueError("neural_noise must have the same shape as state")
+            drive = drive + neural_noise
         return (-state + torch.tanh(drive)) / self.config.tau
 
     def latent_flow(self, kappa: Tensor, inputs: Tensor) -> Tensor:
         """Exact closed latent flow for ``kappa = N^T x``."""
         drive = kappa @ self.m.T + inputs @ self.input_weight.T + self.bias
         return (-kappa + torch.tanh(drive) @ self.n) / self.config.tau
+
+    def latent_jacobian(self, kappa: Tensor, inputs: Tensor) -> Tensor:
+        """Analytic continuous-time Jacobian of the exact latent flow."""
+        drive = kappa @ self.m.T + inputs @ self.input_weight.T + self.bias
+        activation_slope = 1.0 - torch.tanh(drive).square()
+        recurrent_term = torch.einsum(
+            "hi,...h,hj->...ij", self.n, activation_slope, self.m
+        )
+        identity = torch.eye(
+            self.config.rank, dtype=kappa.dtype, device=kappa.device
+        )
+        return (recurrent_term - identity) / self.config.tau
 
     def row_space_flow(
         self, coordinates: Tensor, inputs: Tensor, basis: Tensor
@@ -173,12 +200,47 @@ class Rank2CTRNN(nn.Module):
     def readout(self, kappa: Tensor) -> Tensor:
         return torch.tanh(kappa @ self.readout_weight + self.readout_bias)
 
+    def sample_initial_state(
+        self,
+        batch_size: int,
+        *,
+        mean: float = 0.0,
+        std: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        """Sample ``x(0)=tanh(z)``, ``z~Normal(mean, std^2)``."""
+        if batch_size <= 0 or std < 0:
+            raise ValueError("batch_size must be positive and std non-negative")
+        if std == 0.0:
+            preactivation = torch.full(
+                (batch_size, self.config.state_size),
+                mean,
+                dtype=self.m.dtype,
+                device=self.m.device,
+            )
+        else:
+            preactivation = torch.empty(
+                batch_size,
+                self.config.state_size,
+                dtype=self.m.dtype,
+                device=self.m.device,
+            ).normal_(mean, std, generator=generator)
+        return torch.tanh(preactivation)
+
     def rollout(
-        self, inputs: Tensor, initial_state: Tensor | None = None
+        self,
+        inputs: Tensor,
+        initial_state: Tensor | None = None,
+        *,
+        neural_noise_mean: float = 0.0,
+        neural_noise_std: float = 0.0,
+        generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Euler-integrate a batch and return output, full state, and latent state."""
+        """Euler-integrate, optionally adding Gaussian noise inside ``tanh``."""
         if inputs.ndim != 3 or inputs.shape[-1] != self.config.input_size:
             raise ValueError("inputs must have shape [batch, time, input_size]")
+        if neural_noise_std < 0:
+            raise ValueError("neural_noise_std must be non-negative")
         batch_size, steps, _ = inputs.shape
         state = (
             torch.zeros(
@@ -194,7 +256,18 @@ class Rank2CTRNN(nn.Module):
         states: list[Tensor] = []
         latents: list[Tensor] = []
         for step in range(steps):
-            state = state + self.config.dt * self.flow(state, inputs[:, step])
+            neural_noise = None
+            if neural_noise_std > 0.0:
+                neural_noise = torch.empty_like(state).normal_(
+                    neural_noise_mean,
+                    neural_noise_std,
+                    generator=generator,
+                )
+            elif neural_noise_mean != 0.0:
+                neural_noise = torch.full_like(state, neural_noise_mean)
+            state = state + self.config.dt * self.flow(
+                state, inputs[:, step], neural_noise=neural_noise
+            )
             kappa = self.latent(state)
             states.append(state)
             latents.append(kappa)

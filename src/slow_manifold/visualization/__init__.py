@@ -8,8 +8,11 @@ from .training_dynamics import (
     plot_representative_outputs,
     plot_training_curves,
     render_latent_dynamics_collection,
+    render_high_dimensional_dynamics_collection,
     render_latent_jacobian_collection,
     render_latent_vector_field_collection,
+    resolve_dpi_settings,
+    resolve_render_movies,
 )
 
 __all__ = [
@@ -20,6 +23,9 @@ __all__ = [
     "plot_task_batch",
     "plot_training_curves",
     "render_latent_dynamics_collection",
+    "render_high_dimensional_dynamics_collection",
     "render_latent_jacobian_collection",
     "render_latent_vector_field_collection",
+    "resolve_dpi_settings",
+    "resolve_render_movies",
 ]

@@ -1,6 +1,18 @@
-"""Structured dynamical analyses."""
+"""Structured behavioral and dynamical analyses."""
 
-from .latent_dynamics import AnalysisConfig, LatentDynamicsResult, analyze_checkpoints
+from .checkpoint_selection import (
+    CheckpointSelectionError,
+    CheckpointSelectionResult,
+    RepresentativeSelectionConfig,
+    SelectedCheckpoint,
+    select_representative_checkpoints,
+)
+from .latent_dynamics import (
+    AnalysisConfig,
+    LatentDynamicsResult,
+    NeighborhoodSamplingConfig,
+    analyze_checkpoints,
+)
 from .speed_minima import (
     SpeedMinimumClassificationConfig,
     classify_speed_minimum,
@@ -8,8 +20,14 @@ from .speed_minima import (
 
 __all__ = [
     "AnalysisConfig",
+    "CheckpointSelectionError",
+    "CheckpointSelectionResult",
     "LatentDynamicsResult",
+    "NeighborhoodSamplingConfig",
+    "RepresentativeSelectionConfig",
+    "SelectedCheckpoint",
     "SpeedMinimumClassificationConfig",
     "analyze_checkpoints",
     "classify_speed_minimum",
+    "select_representative_checkpoints",
 ]

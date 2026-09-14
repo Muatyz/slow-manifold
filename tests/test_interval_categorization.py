@@ -8,6 +8,7 @@ from slow_manifold.config import resolve_experiment
 from slow_manifold.tasks import (
     IntervalCategorizationConfig,
     IntervalCategorizationTask,
+    PhaseNormalizedLossConfig,
 )
 from slow_manifold.tasks.interval_categorization import TaskConfigError
 
@@ -15,11 +16,14 @@ ROOT = Path(__file__).parents[1]
 
 
 def make_task(split: str = "train") -> IntervalCategorizationTask:
-    experiment = resolve_experiment(ROOT / "experiments" / "phase0_task_sanity.yaml")
+    experiment = resolve_experiment(ROOT / "experiments" / "phase1_rank2_baseline.yaml")
     config = IntervalCategorizationConfig.from_mapping(
         experiment.components["task"], dt=experiment.components["model"]["dt"]
     )
-    return IntervalCategorizationTask(config, split=split)
+    loss = PhaseNormalizedLossConfig.from_mapping(
+        experiment.components["train"]["loss"]
+    )
+    return IntervalCategorizationTask(config, split=split, loss=loss)
 
 
 def test_batch_is_balanced_and_padded_safely() -> None:
@@ -28,6 +32,8 @@ def test_batch_is_balanced_and_padded_safely() -> None:
 
     labels = np.array([item.class_label for item in batch.metadata])
     assert batch.inputs.shape[:2] == batch.valid_mask.shape
+    assert batch.inputs.shape[-1] == 1
+    assert batch.input_names == ("cue",)
     assert batch.target.shape == batch.loss_mask.shape
     assert np.sum(labels == -1) == np.sum(labels == 1) == 10
     assert np.all(batch.loss_mask[~batch.valid_mask] == 0.0)
@@ -43,7 +49,7 @@ def test_trial_timing_target_and_mask_are_consistent() -> None:
     task = make_task()
     trial = task.build_trial(interval=3.2, delay=2.1, s1_onset=0.7)
     meta = trial.metadata
-    stimulus_steps = round(task.config.stimulus_width / task.config.dt)
+    stimulus_steps = round(task.config.stimulus.width / task.config.dt)
 
     assert meta.s2_step - meta.s1_step == 32
     assert meta.go_step - meta.s2_step == 21
@@ -53,15 +59,38 @@ def test_trial_timing_target_and_mask_are_consistent() -> None:
         trial.inputs[meta.s1_step : meta.s1_step + stimulus_steps, 0] == 1.0
     )
     assert np.all(
-        trial.inputs[meta.s2_step : meta.s2_step + stimulus_steps, 1] == 1.0
+        trial.inputs[meta.s2_step : meta.s2_step + stimulus_steps, 0] == 1.0
     )
     assert np.all(
-        trial.inputs[meta.go_step : meta.go_step + stimulus_steps, 2] == 1.0
+        trial.inputs[meta.go_step : meta.go_step + stimulus_steps, 0] == 1.0
     )
     assert np.all(trial.target[: meta.response_step] == 0.0)
     assert np.all(trial.target[meta.response_step :] == -1.0)
-    assert np.all(trial.loss_mask[: meta.response_step] == 0.1)
-    assert np.all(trial.loss_mask[meta.response_step :] == 1.0)
+    np.testing.assert_allclose(trial.loss_mask[: meta.response_step].sum(), 1.0)
+    np.testing.assert_allclose(trial.loss_mask[meta.response_step :].sum(), 1.0)
+    assert task.collate_trials([trial]).loss_reduction == "batch_mean"
+
+
+def test_train_loss_lambdas_scale_normalized_task_phases() -> None:
+    task = make_task()
+    custom_loss = PhaseNormalizedLossConfig.from_mapping(
+        {
+            "name": "phase_normalized_mse",
+            "phase_weights": [
+                {"phase": "pre_response", "lambda": 2.5},
+                {"phase": "response", "lambda": 0.75},
+            ],
+        }
+    )
+    weighted_task = IntervalCategorizationTask(task.config, loss=custom_loss)
+    trial = weighted_task.build_trial(interval=3.2, delay=2.1, s1_onset=0.7)
+
+    np.testing.assert_allclose(
+        trial.loss_mask[: trial.metadata.response_step].sum(), 2.5
+    )
+    np.testing.assert_allclose(
+        trial.loss_mask[trial.metadata.response_step :].sum(), 0.75
+    )
 
 
 def test_relative_interval_label_does_not_depend_on_onset_or_delay() -> None:
@@ -91,9 +120,30 @@ def test_square_wave_width_is_configurable() -> None:
         interval=3.0, delay=1.0, s1_onset=0.5
     )
 
-    assert np.count_nonzero(trial.inputs[:, 0]) == 5
-    assert np.count_nonzero(trial.inputs[:, 1]) == 5
-    assert np.count_nonzero(trial.inputs[:, 2]) == 5
+    assert trial.inputs.shape[1] == 1
+    assert np.count_nonzero(trial.inputs[:, 0]) == 15
+
+
+def test_stimulus_encoding_must_be_explicit() -> None:
+    experiment = resolve_experiment(ROOT / "experiments" / "phase0_task_sanity.yaml")
+    task_mapping = deepcopy(experiment.components["task"])
+    del task_mapping["stimulus"]["encoding"]
+
+    with pytest.raises(TaskConfigError, match="encoding"):
+        IntervalCategorizationConfig.from_mapping(
+            task_mapping, dt=experiment.components["model"]["dt"]
+        )
+
+
+def test_separate_stimulus_channels_are_rejected() -> None:
+    experiment = resolve_experiment(ROOT / "experiments" / "phase0_task_sanity.yaml")
+    task_mapping = deepcopy(experiment.components["task"])
+    task_mapping["stimulus"]["encoding"] = "separate"
+
+    with pytest.raises(TaskConfigError, match="shared"):
+        IntervalCategorizationConfig.from_mapping(
+            task_mapping, dt=experiment.components["model"]["dt"]
+        )
 
 
 def test_unsupported_waveform_is_rejected() -> None:

@@ -1,0 +1,45 @@
+name: phase2_rank3_smoke
+seed: 20260914
+identity:
+  label_fields:
+    rank: model.rank
+    lr: train.optimizer.learning_rate
+
+components:
+  task: ../configs/task/interval_categorization.yaml
+  model: ../configs/model/rank2_ctrnn.yaml
+  train: ../configs/train/rank2_baseline.yaml
+  analysis: ../configs/analysis/training_dynamics.yaml
+  visualization: ../configs/visualization/training_dynamics.yaml
+  reporting: ../configs/reporting/training_startup.yaml
+
+overrides:
+  model:
+    state_size: 12
+    rank: 3
+  train:
+    device: cpu
+    epochs: 1
+    batch_size: 4
+    validation_batch_size: 8
+    log_every: 1
+    checkpoint:
+      every: 1
+  analysis:
+    representative_selection:
+      mode: manual
+      manual_epochs: [0, 1]
+    trajectory_count: 12
+    neighborhood_sampling:
+      anchor_count: 8
+      samples_per_anchor: 2
+      max_plot_points: 24
+  visualization:
+    training_curves_figure_size: [6.0, 4.0]
+    outputs_panel_width: 3.0
+    outputs_panel_height: 2.0
+    latent_dynamics_3d_figure_size: [15.0, 5.0]
+    snapshot_dpi: 200
+    movie_dpi: 100
+    movie_fps: 2
+    max_3d_trajectories: 12

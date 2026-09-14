@@ -61,3 +61,59 @@ def test_rollout_shapes_are_batch_first() -> None:
     assert outputs.shape == (4, 11, 1)
     assert states.shape == (4, 11, model.config.state_size)
     assert latents.shape == (4, 11, 2)
+
+
+def test_tanh_normal_initial_state_is_seeded() -> None:
+    model = make_model()
+    actual_generator = torch.Generator().manual_seed(41)
+    expected_generator = torch.Generator().manual_seed(41)
+
+    actual = model.sample_initial_state(
+        3, mean=0.0, std=0.1, generator=actual_generator
+    )
+    expected = torch.tanh(
+        torch.empty(3, model.config.state_size).normal_(
+            0.0, 0.1, generator=expected_generator
+        )
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_neural_noise_is_added_inside_tanh_before_euler_step() -> None:
+    model = make_model()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    inputs = torch.zeros(2, 1, model.config.input_size)
+    actual_generator = torch.Generator().manual_seed(73)
+    expected_generator = torch.Generator().manual_seed(73)
+    noise_std = 0.2
+
+    _, states, _ = model.rollout(
+        inputs,
+        neural_noise_std=noise_std,
+        generator=actual_generator,
+    )
+    noise = torch.empty(2, model.config.state_size).normal_(
+        0.0, noise_std, generator=expected_generator
+    )
+    expected = model.config.dt / model.config.tau * torch.tanh(noise)
+
+    torch.testing.assert_close(states[:, 0], expected)
+
+
+def test_zero_noise_arguments_preserve_deterministic_rollout() -> None:
+    model = make_model()
+    inputs = torch.zeros(2, 5, model.config.input_size)
+
+    baseline = model.rollout(inputs)
+    explicit_zero = model.rollout(
+        inputs,
+        neural_noise_mean=0.0,
+        neural_noise_std=0.0,
+        generator=torch.Generator().manual_seed(99),
+    )
+
+    for expected, actual in zip(baseline, explicit_zero):
+        torch.testing.assert_close(actual, expected)

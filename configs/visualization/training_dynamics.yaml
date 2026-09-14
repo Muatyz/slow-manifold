@@ -1,11 +1,21 @@
 name: training_dynamics
 training_curves_figure_size: [8.0, 6.0]
+# loss 使用对数 y 轴以观察跨数量级变化和 abrupt learning；可改为 linear。
+loss_y_scale: log
 outputs_panel_width: 4.0
 outputs_panel_height: 2.5
-vector_field_figure_size: [6.0, 5.5]
+vector_field_figure_size: [6.0, 6.0]
 # 同步展示 vector field 与 Jacobian 的双栏画布。
-latent_dynamics_figure_size: [12.0, 5.5]
-vector_field_dpi: 120
+latent_dynamics_figure_size: [12.0, 6.0]
+# K>=3 的 trajectory / low-q / near-zero-spectrum 三栏 3-D 画布。
+latent_dynamics_3d_figure_size: [18.0, 6.0]
+max_3d_trajectories: 64
+# PNG 与 MP4 分开控制，避免 smoke movie 的成本设置降低静态图清晰度。
+snapshot_dpi: 240
+movie_dpi: 120
+# MP4 encoding scales with every analyzed checkpoint and is disabled by
+# default. Enable it only in recipes intended to study learning movies.
+render_movies: false
 movie_fps: 5
 movie_codec: libx264
 # vector 箭头采样密度:在 flow grid 上每隔 n 个点画一个箭头, n 越小越密。
@@ -13,8 +23,10 @@ movie_codec: libx264
 arrow_stride: 1
 arrow_color: black
 # 箭头长度为当前坐标跨度的比例；width 使用 Matplotlib quiver 的轴宽单位。
-arrow_length_fraction: 0.012
-arrow_width: 0.002
+arrow_length_fraction: 0.0075
+arrow_width: 0.0012
+# task trajectory 主线宽；基线、cue overlay、描边与终点 marker 同比缩放。
+trajectory_line_width: 0.9
 # max Re(lambda(J_kappa)) 的对称色标半宽；null 时从全部 checkpoints 自动推导。
 jacobian_spectral_abscissa_limit: null
 # decision band = 决策模糊区,在 readout logit z 上的半宽 w(Dinc 约定:

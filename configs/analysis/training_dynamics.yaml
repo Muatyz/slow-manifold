@@ -1,14 +1,48 @@
 name: training_dynamics
-input_condition: [0.0, 0.0, 0.0]
-representative_epochs: [0, 100, 500, 1000, 5000]
-grid_points: 41
+input_condition: [0.0]
+# 训练后根据 validation trace 选择阶段；这里只定义规则，不预填 epoch。
+# 罗马数字只表示展示顺序，具体角色与判据写入 checkpoint_selection.yaml。
+representative_selection:
+  mode: auto
+  metric: validation_loss
+  direction: minimize
+  transform: log
+  max_epochs: 5
+  # 平滑曲线定位阶段，并在同一局部窗口内选择实际展示的 checkpoint。
+  # 下列窗口均以“已保存 checkpoint 点数”为单位，而不是 raw epoch 数。
+  smoothing_points: 5
+  transition_radius_points: 3
+  baseline_points: 20
+  abrupt_effect_mad: 5.0
+  abrupt_slope_ratio: 5.0
+  plateau_points: 50
+  plateau_max_relative_improvement: 0.02
+  progress_fractions: [0.25, 0.5, 0.75]
+  manual_epochs: []
+grid_points: 100
 # 显式绘图范围 [x_min, x_max, y_min, y_max]; null 时由 trajectory 推导,
 # 且当 grid-minimum 候选贴近边缘(慢结构可能被截断)时按下面参数向外扩张。
 coordinate_bounds: null
+# 将较短轴围绕中心扩展到与较长轴等跨度；不拉伸或裁剪相平面。
+square_coordinate_bounds: true
 padding_fraction: 0.2
 bounds_expansion_fraction: 0.5
 max_bounds_expansions: 2
 speed_floor: 1.0e-8
+# K>=3: draw a reproducible validation-distribution cohort for 3-D trajectory
+# geometry. These trajectories are separate from the explicit output panels.
+trajectory_count: 128
+trajectory_seed: 20260914
+# K>=3: sample in the full exact K-D kappa space around task trajectories.
+# PCA (when K>3) is applied only after q/Jacobian have been evaluated.
+neighborhood_sampling:
+  anchor_count: 64
+  samples_per_anchor: 8
+  radius_fraction: 0.05
+  minimum_radius: 1.0e-3
+  low_q_quantile: 0.05
+  near_zero_eigenvalue_tolerance: 1.0e-2
+  max_plot_points: 512
 # 先以八邻域筛选网格候选，再连续最小化 q=0.5*||tau*F_kappa||^2。
 speed_minimum_classification:
   max_iterations: 75
@@ -22,6 +56,12 @@ speed_minimum_classification:
   deduplication_tolerance: 1.0e-3
 evaluation_trials:
   - interval: 3.0
+    delay: 2.0
+    s1_onset: 1.0
+  - interval: 4.5
+    delay: 2.0
+    s1_onset: 1.0
+  - interval: 5.5
     delay: 2.0
     s1_onset: 1.0
   - interval: 7.0

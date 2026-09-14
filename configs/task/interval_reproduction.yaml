@@ -11,12 +11,6 @@ stimulus:
 target:
   baseline: 0.0
   response: 1.0
-loss:
-  name: phase_normalized_mse
-  phase_weights:
-    pre_go: 1.0
-    reproduction_wait: 1.0
-    response: 1.0
 evaluation:
   response_threshold: 0.5
   sustained_steps: 1

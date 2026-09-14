@@ -1,6 +1,6 @@
-# Rank-2 RNN Timing Dynamics：实施前研究计划
+# Low-Rank RNN Timing Dynamics：研究计划
 
-> 状态（2026-09-07）：Task A 已完成一个 seed 的正式 baseline；Task B（Interval Reproduction）已完成 generator、phase-normalized loss、行为指标与端到端 smoke pipeline，正式训练尚未开始。multi-seed、trajectory/global 初始化、eigenvectors 与 full-state ghost diagnostics 尚未完成。
+> 状态（2026-09-15）：rank-K 训练公共路径和 K≥3 的 trajectory-neighborhood diagnostics 已实现；K=3 使用 exact κ 三坐标，K>3（含 K=4）使用 task-trajectory PCA 前三轴显示。Task A/B 的 rank-3/rank-5 端到端 smoke 与 checkpoint resume 已通过；正式训练、multi-seed、连续 slow-point refinement、eigenvectors 与 full-state ghost diagnostics 尚未完成。
 
 ## 1. 研究目标
 
@@ -36,6 +36,7 @@ Trial：
 - `T=t(S2)-t(S1)`。
 - `T<T_c` 为 short，target 为 `-1`；`T>T_c` 为 long，target 为 `+1`。
 - `T=T_c` 的标签或采样排除规则必须在配置中明确。
+- S1、S2、Go 与 Task B 共用同一方波 stimulus 生成器和标量输入通道。
 - Go 之前 target 为 `0`；仅在 Go 后的 response window 报告类别。
 - 随机化 S1 onset 和 `T_delay`，避免网络依赖绝对 trial time。
 - short/long 两类平衡采样，并显式保存 `S1/S2/Go time`、`T`、`T_delay` 和 class。
@@ -72,7 +73,7 @@ Recurrent matrix：
 
 ### 3.3 Interval Reproduction（Task B）
 
-- 沿用同一个 rank-2/tanh CTRNN；S1、S2、Go 共用一个方波输入通道。
+- 沿用同一个 rank-2/tanh CTRNN；S1、S2、Go 共用 Task A 的方波 stimulus 逻辑。
 - Go 后观察 `2T`：前 `T` 为 reproduction-wait，后 `T` target 为 1。
 - pre-Go、wait、response 的 MSE 分别按阶段时长归一化，再按配置权重相加并对 batch 平均。
 - 用首次持续阈值穿越报告 timing MAE/RMSE/bias、premature rate 与 no-response rate。
@@ -95,10 +96,16 @@ Recurrent matrix：
 ### Phase 1：训练 rank-2 baseline
 
 - [x] 通过公共 runner 跑通短程 CPU/CUDA smoke training，并生成完整 run 目录。
-- [x] 用一个 seed 完成正式 baseline 训练；单 seed 仅作工程验收。
+- [x] 将 Task A 改为 train-owned、分阶段时长归一化的 MSE；首个对照设
+  `lambda(pre_response)=lambda(response)=1`，Task B 复用同一配置入口。
+- [ ] 完成上述等权 loss 的单-seed Task A 实验，并据结果决定是否扫描 phase lambda。
+- [ ] 用一个 seed 完成共享输入协议的正式 baseline。
 - [ ] 建立小型 multi-seed cohort。
 - [x] 记录 train/validation loss、accuracy、gradient norm、learning rate、`‖M‖/‖N‖/‖W‖` 和两个 singular values。
+- [x] 配置化 validation 频率；checkpoint/final 强制验证，并分别记录 train/validation 耗时。
 - [x] 保存 initial、periodic、best、final checkpoints，以及 model/optimizer/config/seed/metrics 和 RNG state。
+- [x] interrupted/failed run 可从最新一致 checkpoint 原目录恢复；恢复 model、optimizer、RNG 与 metrics，并拒绝修改冻结训练配置。
+- [x] 配置化 Dinc-style firing-rate 初态与 neural noise；零标准差向后兼容历史 run，并保存独立 RNG states。
 - [ ] checkpoint 频率足以解析潜在的快速行为跃迁。
 - [ ] 用 psychometric curve 检查网络确实利用 interval，而不是记忆少数离散模板。
 
@@ -110,7 +117,7 @@ Recurrent matrix：
 
 `q_κ(κ)=1/2‖F_κ(κ,u)‖²`。
 
-优先分析 autonomous `u=0`，再按需要比较 S1、S2 和 Go 条件，因为输入会重构 vector field。
+优先分析 autonomous `u=0`，再按需要比较 cue-on `u=amplitude` 条件，因为输入会重构 vector field。
 
 - [x] 在跨 checkpoint 对齐的二维网格评估 `F_κ` 与 normalized speed，并保存结构化 NPZ/YAML。
 - [x] 在同一网格解析计算 exact latent Jacobian，保存完整复特征值与 `max Re(λ)` spectral-abscissa map。
@@ -135,9 +142,12 @@ rank-2 factorization 存在 `M→MA, N→NA^(-T)` 的 gauge freedom。跨 checkp
 - [x] 跨帧固定坐标范围、evaluation trials 和 speed color scale。
 - [x] 支持在 initial、配置指定的 intermediate 和 final checkpoints 生成 output panels 与初步 MP4。
 - [x] 在同一 snapshot/MP4 中同步展示 vector field 与 Jacobian spectral abscissa。
-- [x] 轨迹使用颜色编码任务条件、线型编码任务阶段，并在独立图与联合图中保持一致。
+- [x] 轨迹使用颜色编码任务条件、线型编码任务阶段，单独标出 cue-driven 位移，并在独立图与联合图中保持一致。
+- [x] κ 平面支持正方形 bounds，并以共享 `grid_points` 配置 speed/Jacobian 色块密度。
 - [x] 联合绘制 loss、validation loss 与 gradient norm，并标注代表性 epochs。
+- [x] 训练后自动选择 representative checkpoints，区分 abrupt/gradual 与末段 quasi-plateau，并保存可追溯 manifest；同时保留人工 override。
 - [ ] 在正式训练后定位 behavioral transition，并重复完整 Phase 2 diagnostics。
+- [ ] 为 Task A/B 分别定义能力获得的持续性行为判据，用于验证 loss-based transition，而不把自动分段直接解释为“学会”或 optimum。
 - [ ] 联合比较 accuracy、`min(q)`、slow-region extent、local spectrum 和 residence time。
 - [ ] 若出现 abrupt learning，先定义可复现的行为判据，再检查 slow structure 与行为改变的时间顺序。
 
@@ -155,9 +165,24 @@ categorization 的 generalization 与 interval reproduction 不完全等价，�
 
 验收：分别报告 interval、delay 和 onset 三类泛化；明确描述性、相关性与机制性证据的边界。
 
-### Phase 5：full-rank extension
+### Phase 5：rank-K（K≥3）extension
 
-仅在 rank-2 milestone 完成后进入：
+- [x] 解除模型、训练指标与 checkpoint 对 rank=2 的硬编码，并逐项保存 K 个 singular values。
+- [x] K=3 直接显示 exact κ₁–κ₃；K>3（包括 K=4）在 task-trajectory κ states 上拟合并对齐 PC1–3。
+- [x] 以大量 validation-distribution trajectories 描述几何；高维图以颜色和线型编码任务阶段、终点 marker 编码任务条件，并保留 cue-on 标记。
+- [x] 在 task trajectories 附近的完整 K 维 κ 空间采样，保存 `q=1/2||τFκ||²`、exact K×K Jacobian、完整 eigenvalues 与 spectral abscissa。
+- [x] 以独立 3-D 子图显示 sampled low-q regions 与 near-zero spectral-abscissa regions，不绘制 3-D vector field。
+- [x] Task A/B 的 rank-3 与 rank-5 CPU 端到端 smoke pipeline。
+- [x] 准备 Task A/B × rank-3/rank-5 的首轮 paired-seed 正式 recipes；视频默认关闭，周期 checkpoint 间隔限制训练后高维诊断规模。
+- [ ] 启动 rank-3/rank-5 正式训练并按与 rank-2 相同的行为判据验收。
+- [ ] 把低 q 邻域样本作为连续 `qκ` minimization 的 task-trajectory initializations，并保存优化状态与去重结果。
+- [ ] 比较 rank-2/3/5 的 behavior、residence time、slow-region extent 与 local spectrum；不得选择性展示 seed。
+
+验收：相同 task/train protocol 下形成可追溯的 rank cohort；PCA 仅承担显示，动力学结论来自完整 K 维计算。
+
+### Phase 6：full-rank extension
+
+仅在 low-rank cohort 的行为与静态 diagnostics 通过验收后进入：
 
 - [ ] 保持 task、训练 protocol 和主要超参数尽可能一致，只移除 rank constraint。
 - [ ] slow-point search 和 Jacobian analysis 在完整状态空间进行；PCA 只用于展示。
@@ -187,6 +212,8 @@ categorization 的 generalization 与 interval reproduction 不完全等价，�
 - near-zero eigenvalue ≠ criticality 或 saddle-node bifurcation 的充分证据。
 - slow point ≠ ghost；ghost 还需要 transverse stability。
 - rank-2 exact latent dynamics ≠ full-rank 网络也具有同样的二维闭合系统。
+- K>3 的 PC1–3 trajectory geometry ≠ 三维闭合动力学；PCA 投影中的接近也不等于 K 维状态接近。
+- trajectory-neighborhood low-q sample ≠ 已连续优化验证的 slow point。
 - 不挑选性地只展示符合预期的 seed。
 
 ## 8. 暂缓内容

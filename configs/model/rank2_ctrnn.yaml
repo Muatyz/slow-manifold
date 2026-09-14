@@ -1,5 +1,7 @@
-name: rank2_ctrnn
-input_size: 3
+# Historical filename retained so existing recipes keep resolving. Override
+# `rank` in an experiment recipe to train any low-rank K <= state_size.
+name: low_rank_ctrnn
+input_size: 1
 state_size: 64
 rank: 2
 output_size: 1

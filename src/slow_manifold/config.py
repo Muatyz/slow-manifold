@@ -183,9 +183,17 @@ def get_config_value(components: Mapping[str, Any], path: str) -> Any:
     """Resolve a dotted path such as ``train.optimizer.learning_rate``."""
     value: Any = components
     for part in path.split("."):
-        if not part or not isinstance(value, Mapping) or part not in value:
+        if not part:
             raise ConfigError(f"Config value path does not exist: {path}")
-        value = value[part]
+        if isinstance(value, Mapping) and part in value:
+            value = value[part]
+            continue
+        if isinstance(value, (list, tuple)) and part.isdigit():
+            index = int(part)
+            if 0 <= index < len(value):
+                value = value[index]
+                continue
+        raise ConfigError(f"Config value path does not exist: {path}")
     return value
 
 

@@ -7,6 +7,9 @@ num_threads: 2
 epochs: 5000
 batch_size: 32
 validation_batch_size: 128
+# Run validation every n updates. Epoch 0, final, and saved checkpoints are
+# always validated even when they do not fall on this cadence.
+validation_every: 10
 log_every: 10
 optimizer:
   name: adam
@@ -14,5 +17,34 @@ optimizer:
   betas: [0.9, 0.999]
   weight_decay: 0.0
 gradient_clip_norm: null
+# Trial phases are normalized by their own number of time steps, then summed
+# and averaged over the batch. Change these lambdas in an experiment override.
+loss:
+  name: phase_normalized_mse
+  phase_weights:
+    - {phase: pre_response, lambda: 1.0}
+    - {phase: response, lambda: 1.0}
+# Dinc-style stochastic rollout. Historical configs without this block resolve
+# both standard deviations to 0, reproducing the former zero-state/no-noise path.
+rollout:
+  initial_state:
+    distribution: tanh_normal
+    mean: 0.0
+    std: 0.1
+  neural_noise:
+    distribution: normal
+    mean: 0.0
+    # N(0, 1e-6) interpreted as variance 1e-6, hence std=1e-3.
+    std: 1.0e-3
+    # epsilon is added to W*x + W_in*u + b before tanh.
+    injection: activation_input
+  contexts:
+    train:
+      sample_initial_state: true
+      apply_neural_noise: true
+    validation:
+      # Sample once per run and reuse it at every validation epoch.
+      sample_initial_state: true
+      apply_neural_noise: false
 checkpoint:
   every: 100

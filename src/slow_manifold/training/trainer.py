@@ -1,4 +1,4 @@
-"""Training loop for configured rank-2 CTRNN experiments."""
+"""Training loop for configured low-rank CTRNN experiments."""
 
 from __future__ import annotations
 
@@ -6,22 +6,138 @@ import csv
 import os
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from uuid import uuid4
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from slow_manifold.models import Rank2CTRNN
-from slow_manifold.tasks import ConfiguredTask, TaskBatch
-from slow_manifold.training.checkpoint import save_checkpoint
+from slow_manifold.tasks import ConfiguredTask, PhaseNormalizedLossConfig, TaskBatch
+from slow_manifold.training.checkpoint import load_checkpoint, save_checkpoint
 from slow_manifold.utils.logging import get_logger
 
 
 class TrainConfigError(ValueError):
     """Raised when training configuration is invalid."""
+
+
+@dataclass(frozen=True)
+class InitialStateConfig:
+    """Distribution of the firing-rate state at the start of each trial."""
+
+    distribution: str = "tanh_normal"
+    mean: float = 0.0
+    std: float = 0.0
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "InitialStateConfig":
+        values = {} if data is None else data
+        if not isinstance(values, Mapping):
+            raise TrainConfigError("rollout.initial_state must be a mapping")
+        config = cls(
+            distribution=str(values.get("distribution", "tanh_normal")),
+            mean=float(values.get("mean", 0.0)),
+            std=float(values.get("std", 0.0)),
+        )
+        if config.distribution != "tanh_normal":
+            raise TrainConfigError("Only tanh_normal initial states are supported")
+        if not isfinite(config.mean) or not isfinite(config.std) or config.std < 0:
+            raise TrainConfigError("Initial-state mean/std must be finite and std >= 0")
+        return config
+
+
+@dataclass(frozen=True)
+class NeuralNoiseConfig:
+    """Gaussian noise added to the activation input at every Euler step."""
+
+    distribution: str = "normal"
+    mean: float = 0.0
+    std: float = 0.0
+    injection: str = "activation_input"
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "NeuralNoiseConfig":
+        values = {} if data is None else data
+        if not isinstance(values, Mapping):
+            raise TrainConfigError("rollout.neural_noise must be a mapping")
+        config = cls(
+            distribution=str(values.get("distribution", "normal")),
+            mean=float(values.get("mean", 0.0)),
+            std=float(values.get("std", 0.0)),
+            injection=str(values.get("injection", "activation_input")),
+        )
+        if config.distribution != "normal":
+            raise TrainConfigError("Only normal neural noise is supported")
+        if config.injection != "activation_input":
+            raise TrainConfigError("Only activation_input neural noise is supported")
+        if not isfinite(config.mean) or not isfinite(config.std) or config.std < 0:
+            raise TrainConfigError("Neural-noise mean/std must be finite and std >= 0")
+        return config
+
+
+@dataclass(frozen=True)
+class RolloutContextConfig:
+    sample_initial_state: bool
+    apply_neural_noise: bool
+
+    @classmethod
+    def from_mapping(
+        cls,
+        data: Mapping[str, Any] | None,
+        *,
+        default_initial_state: bool,
+        default_neural_noise: bool,
+        name: str,
+    ) -> "RolloutContextConfig":
+        values = {} if data is None else data
+        if not isinstance(values, Mapping):
+            raise TrainConfigError(f"rollout.contexts.{name} must be a mapping")
+        initial_state = values.get("sample_initial_state", default_initial_state)
+        neural_noise = values.get("apply_neural_noise", default_neural_noise)
+        if not isinstance(initial_state, bool) or not isinstance(neural_noise, bool):
+            raise TrainConfigError(f"rollout.contexts.{name} flags must be boolean")
+        return cls(
+            sample_initial_state=initial_state,
+            apply_neural_noise=neural_noise,
+        )
+
+
+@dataclass(frozen=True)
+class RolloutConfig:
+    initial_state: InitialStateConfig
+    neural_noise: NeuralNoiseConfig
+    train: RolloutContextConfig
+    validation: RolloutContextConfig
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "RolloutConfig":
+        values = {} if data is None else data
+        if not isinstance(values, Mapping):
+            raise TrainConfigError("rollout must be a mapping")
+        contexts = values.get("contexts", {})
+        if not isinstance(contexts, Mapping):
+            raise TrainConfigError("rollout.contexts must be a mapping")
+        return cls(
+            initial_state=InitialStateConfig.from_mapping(values.get("initial_state")),
+            neural_noise=NeuralNoiseConfig.from_mapping(values.get("neural_noise")),
+            train=RolloutContextConfig.from_mapping(
+                contexts.get("train"),
+                default_initial_state=True,
+                default_neural_noise=True,
+                name="train",
+            ),
+            validation=RolloutContextConfig.from_mapping(
+                contexts.get("validation"),
+                default_initial_state=True,
+                default_neural_noise=False,
+                name="validation",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -31,6 +147,7 @@ class TrainConfig:
     epochs: int
     batch_size: int
     validation_batch_size: int
+    validation_every: int
     log_every: int
     optimizer_name: str
     learning_rate: float
@@ -38,6 +155,8 @@ class TrainConfig:
     weight_decay: float
     gradient_clip_norm: float | None
     checkpoint_every: int
+    loss: PhaseNormalizedLossConfig
+    rollout: RolloutConfig
     num_threads: int | None = None
 
     @classmethod
@@ -55,6 +174,7 @@ class TrainConfig:
                 epochs=int(data["epochs"]),
                 batch_size=int(data["batch_size"]),
                 validation_batch_size=int(data["validation_batch_size"]),
+                validation_every=int(data.get("validation_every", 1)),
                 log_every=int(data["log_every"]),
                 optimizer_name=str(optimizer["name"]),
                 learning_rate=float(optimizer["learning_rate"]),
@@ -62,6 +182,8 @@ class TrainConfig:
                 weight_decay=float(optimizer["weight_decay"]),
                 gradient_clip_norm=None if clip is None else float(clip),
                 checkpoint_every=int(checkpoint["every"]),
+                loss=PhaseNormalizedLossConfig.from_mapping(data.get("loss")),
+                rollout=RolloutConfig.from_mapping(data.get("rollout")),
                 num_threads=None if num_threads is None else int(num_threads),
             )
         except (KeyError, IndexError, TypeError) as error:
@@ -74,7 +196,12 @@ class TrainConfig:
             raise TrainConfigError("device must be cpu or cuda")
         if self.device == "cuda" and not torch.cuda.is_available():
             raise TrainConfigError("CUDA was requested but is not available")
-        if self.epochs <= 0 or self.log_every <= 0 or self.checkpoint_every <= 0:
+        if (
+            self.epochs <= 0
+            or self.validation_every <= 0
+            or self.log_every <= 0
+            or self.checkpoint_every <= 0
+        ):
             raise TrainConfigError("epochs and frequencies must be positive")
         if self.batch_size <= 0:
             raise TrainConfigError("batch_size must be positive")
@@ -94,7 +221,7 @@ class TrainConfig:
 
 @dataclass(frozen=True)
 class TrainingResult:
-    history: tuple[dict[str, float | int], ...]
+    history: tuple[dict[str, float | int | None], ...]
     checkpoint_paths: dict[int, Path]
     best_epoch: int
 
@@ -105,12 +232,14 @@ def train_model(
     train_task: ConfiguredTask,
     validation_batch: TaskBatch,
     train_rng: np.random.Generator,
+    rollout_seeds: Mapping[str, int],
     config: TrainConfig,
     run_dir: Path,
     snapshot_epochs: Sequence[int],
     resolved_config: Mapping[str, Any],
+    resume_payload: Mapping[str, Any] | None = None,
 ) -> TrainingResult:
-    """Train while recording Dinc-style optimization diagnostics."""
+    """Train or resume while recording Dinc-style optimization diagnostics."""
     if config.num_threads is not None:
         # Cap the PyTorch intra-op thread pool per the resolved train config.
         # Wall-clock is insensitive to this value on CUDA (benchmarked), while a
@@ -120,6 +249,21 @@ def train_model(
         torch.set_num_threads(config.num_threads)
     device = torch.device(config.device)
     model.to(device)
+    required_rollout_streams = {
+        "initial_state_train",
+        "neural_noise_train",
+        "initial_state_validation",
+        "neural_noise_validation",
+    }
+    missing_streams = required_rollout_streams - set(rollout_seeds)
+    if missing_streams:
+        raise ValueError(
+            "Missing rollout RNG seeds: " + ", ".join(sorted(missing_streams))
+        )
+    rollout_generators = {
+        name: torch.Generator(device=device).manual_seed(int(rollout_seeds[name]))
+        for name in sorted(required_rollout_streams)
+    }
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
@@ -129,25 +273,37 @@ def train_model(
     requested_snapshots = {int(epoch) for epoch in snapshot_epochs}
     requested_snapshots.update({0, config.epochs})
     checkpoint_paths: dict[int, Path] = {}
-    history: list[dict[str, float | int]] = []
+    history: list[dict[str, float | int | None]] = []
     metrics_path = run_dir / "metrics.csv"
     logger = get_logger("train")
     logger.info(
-        "training started epochs=%d batch_size=%d device=%s learning_rate=%s "
+        "training %s epochs=%d batch_size=%d validation_every=%d "
+        "device=%s learning_rate=%s initial_state_std=%g neural_noise_std=%g "
         "torch_intra_threads=%d",
+        "resuming" if resume_payload is not None else "started",
         config.epochs,
         config.batch_size,
+        config.validation_every,
         config.device,
         config.learning_rate,
+        config.rollout.initial_state.std,
+        config.rollout.neural_noise.std,
         torch.get_num_threads(),
     )
     training_started = time.perf_counter()
     elapsed_seconds = 0.0
     step_seconds: deque[float] = deque(maxlen=100)
+    validation_initial_state = _sample_context_initial_state(
+        model,
+        batch_size=validation_batch.inputs.shape[0],
+        initial_state=config.rollout.initial_state,
+        enabled=config.rollout.validation.sample_initial_state,
+        generator=rollout_generators["initial_state_validation"],
+    )
 
     def _measured_step(
-        *, batch: TaskBatch, epoch: int, update: bool
-    ) -> dict[str, float | int]:
+        *, batch: TaskBatch, epoch: int, update: bool, validate: bool
+    ) -> dict[str, float | int | None]:
         """Run one measured step and append wall-clock timing to its row."""
         nonlocal elapsed_seconds
         start = time.perf_counter()
@@ -161,6 +317,10 @@ def train_model(
             epoch=epoch,
             device=device,
             task=train_task,
+            rollout=config.rollout,
+            validation_initial_state=validation_initial_state,
+            rollout_generators=rollout_generators,
+            validate=validate,
         )
         duration = time.perf_counter() - start
         elapsed_seconds += duration
@@ -168,44 +328,134 @@ def train_model(
         row["elapsed_seconds"] = elapsed_seconds
         return row
 
-    initial_batch = train_task.generate_batch(config.batch_size, train_rng)
-    initial_row = _measured_step(batch=initial_batch, epoch=0, update=False)
-    history.append(initial_row)
-    _append_metric(metrics_path, initial_row, create=True)
-    checkpoint_paths[0] = _save_epoch_checkpoint(
-        model, optimizer, train_rng, config, history, resolved_config, run_dir, 0
-    )
-    save_checkpoint(
-        _checkpoint_payload(
-            model, optimizer, train_rng, config, history, resolved_config, 0
-        ),
-        run_dir / "checkpoints" / "initial.pt",
-    )
+    start_epoch = 0
+    metric_fields: tuple[str, ...]
+    best_epoch: int
+    best_loss: float
+    if resume_payload is not None:
+        start_epoch = _restore_training_state(
+            payload=resume_payload,
+            model=model,
+            optimizer=optimizer,
+            train_rng=train_rng,
+            rollout_generators=rollout_generators,
+            target_epoch=config.epochs,
+        )
+        best_payload = load_checkpoint(run_dir / "checkpoints" / "best.pt")
+        best_epoch = int(best_payload["epoch"])
+        if best_epoch > start_epoch:
+            raise ValueError(
+                "best.pt is newer than the selected resume checkpoint; "
+                "resume selection is inconsistent"
+            )
+        best_metric = best_payload.get("metrics", {}).get("validation_loss")
+        if best_metric is None:
+            raise ValueError("best.pt does not contain a validation_loss")
+        best_loss = float(best_metric)
+        history, discarded_rows = _read_metrics_for_resume(
+            metrics_path, checkpoint_epoch=start_epoch
+        )
+        metric_fields = tuple(history[0])
+        elapsed_seconds = float(history[-1].get("elapsed_seconds") or 0.0)
+        step_seconds.extend(
+            float(row["epoch_seconds"])
+            for row in history[-100:]
+            if row.get("epoch_seconds") is not None
+        )
+        checkpoint_paths = _existing_epoch_checkpoint_paths(
+            run_dir, maximum_epoch=start_epoch
+        )
+        logger.info(
+            "training state restored checkpoint_epoch=%d target_epoch=%d "
+            "metrics_rows=%d discarded_metric_rows=%d best_epoch=%d",
+            start_epoch,
+            config.epochs,
+            len(history),
+            discarded_rows,
+            best_epoch,
+        )
+    else:
+        initial_batch = train_task.generate_batch(config.batch_size, train_rng)
+        initial_row = _measured_step(
+            batch=initial_batch, epoch=0, update=False, validate=True
+        )
+        metric_fields = tuple(initial_row)
+        history.append(initial_row)
+        _append_metric(metrics_path, initial_row, create=True)
+        checkpoint_paths[0] = _save_epoch_checkpoint(
+            model,
+            optimizer,
+            train_rng,
+            rollout_generators,
+            config,
+            history,
+            resolved_config,
+            run_dir,
+            0,
+        )
+        save_checkpoint(
+            _checkpoint_payload(
+                model,
+                optimizer,
+                train_rng,
+                rollout_generators,
+                config,
+                history,
+                resolved_config,
+                0,
+            ),
+            run_dir / "checkpoints" / "initial.pt",
+        )
 
-    best_epoch = 0
-    best_loss = float(initial_row["validation_loss"])
-    save_checkpoint(
-        _checkpoint_payload(
-            model, optimizer, train_rng, config, history, resolved_config, 0
-        ),
-        run_dir / "checkpoints" / "best.pt",
-    )
+        best_epoch = 0
+        best_loss = float(initial_row["validation_loss"])
+        save_checkpoint(
+            _checkpoint_payload(
+                model,
+                optimizer,
+                train_rng,
+                rollout_generators,
+                config,
+                history,
+                resolved_config,
+                0,
+            ),
+            run_dir / "checkpoints" / "best.pt",
+        )
 
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(start_epoch + 1, config.epochs + 1):
+        should_snapshot = (
+            epoch % config.checkpoint_every == 0
+            or epoch in requested_snapshots
+            or epoch == config.epochs
+        )
+        should_validate = (
+            epoch % config.validation_every == 0
+            or should_snapshot
+            or epoch == config.epochs
+        )
         batch = train_task.generate_batch(config.batch_size, train_rng)
-        row = _measured_step(batch=batch, epoch=epoch, update=True)
+        measured = _measured_step(
+            batch=batch,
+            epoch=epoch,
+            update=True,
+            validate=should_validate,
+        )
+        row = {field: measured.get(field) for field in metric_fields}
         step_seconds.append(row["epoch_seconds"])
         history.append(row)
         _append_metric(metrics_path, row, create=False)
 
-        if float(row["validation_loss"]) < best_loss:
-            best_loss = float(row["validation_loss"])
+        validation_loss = row["validation_loss"]
+        if validation_loss is not None and float(validation_loss) < best_loss:
+            best_loss = float(validation_loss)
             best_epoch = epoch
             save_checkpoint(
                 _checkpoint_payload(
                     model,
                     optimizer,
                     train_rng,
+                    rollout_generators,
                     config,
                     history,
                     resolved_config,
@@ -214,17 +464,13 @@ def train_model(
                 run_dir / "checkpoints" / "best.pt",
             )
 
-        should_snapshot = (
-            epoch % config.checkpoint_every == 0
-            or epoch in requested_snapshots
-            or epoch == config.epochs
-        )
         if should_snapshot:
             start = time.perf_counter()
             checkpoint_paths[epoch] = _save_epoch_checkpoint(
                 model,
                 optimizer,
                 train_rng,
+                rollout_generators,
                 config,
                 history,
                 resolved_config,
@@ -238,29 +484,18 @@ def train_model(
                 time.perf_counter() - start,
             )
         if epoch % config.log_every == 0 or epoch == config.epochs:
-            behavior = " ".join(
-                f"{key.removeprefix('validation_')}={value:.3g}"
-                for key, value in row.items()
-                if key.startswith("validation_") and key != "validation_loss"
-            )
-            logger.info(
-                "step=%d train_loss=%.6g validation_loss=%.6g %s "
-                "epoch_seconds=%.2fs elapsed=%.1fs eta=%s",
-                epoch,
-                row["train_loss"],
-                row["validation_loss"],
-                behavior,
-                row["epoch_seconds"],
-                row["elapsed_seconds"],
-                _format_duration(
-                    _eta_seconds(config.epochs, epoch, step_seconds)
-                ),
+            _log_training_progress(
+                logger=logger,
+                row=row,
+                epoch=epoch,
+                eta_seconds=_eta_seconds(config.epochs, epoch, step_seconds),
             )
 
     final_payload = _checkpoint_payload(
         model,
         optimizer,
         train_rng,
+        rollout_generators,
         config,
         history,
         resolved_config,
@@ -299,11 +534,34 @@ def _measure_step(
     epoch: int,
     device: torch.device,
     task: ConfiguredTask,
-) -> dict[str, float | int]:
+    rollout: RolloutConfig,
+    validation_initial_state: Tensor | None,
+    rollout_generators: Mapping[str, torch.Generator],
+    validate: bool,
+) -> dict[str, float | int | None]:
+    train_started = time.perf_counter()
     model.train()
     optimizer.zero_grad(set_to_none=True)
     train = _torch_batch(batch, device, model.config.torch_dtype)
-    prediction, _, _ = model.rollout(train["inputs"])
+    train_initial_state = _sample_context_initial_state(
+        model,
+        batch_size=batch.inputs.shape[0],
+        initial_state=rollout.initial_state,
+        enabled=rollout.train.sample_initial_state,
+        generator=rollout_generators["initial_state_train"],
+    )
+    train_noise = rollout.neural_noise
+    prediction, _, _ = model.rollout(
+        train["inputs"],
+        initial_state=train_initial_state,
+        neural_noise_mean=(
+            train_noise.mean if rollout.train.apply_neural_noise else 0.0
+        ),
+        neural_noise_std=(
+            train_noise.std if rollout.train.apply_neural_noise else 0.0
+        ),
+        generator=rollout_generators["neural_noise_train"],
+    )
     train_loss = _masked_mse(
         prediction,
         train["target"],
@@ -319,12 +577,45 @@ def _measure_step(
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
         optimizer.step()
 
+    with torch.no_grad():
+        parameter_diagnostics = _parameter_diagnostics(model)
+    result: dict[str, float | int | None] = {
+        "epoch": epoch,
+        "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "train_loss": float(train_loss.detach().cpu()),
+        "recurrent_gradient_norm": recurrent_gradient_norm,
+        "total_gradient_norm": total_gradient_norm,
+        **parameter_diagnostics,
+        "train_seconds": time.perf_counter() - train_started,
+        "validation_ran": int(validate),
+    }
+    if not validate:
+        result["validation_loss"] = None
+        result["validation_seconds"] = 0.0
+        return result
+
+    validation_started = time.perf_counter()
     model.eval()
     with torch.no_grad():
         validation = _torch_batch(
             validation_batch, device, model.config.torch_dtype
         )
-        validation_prediction, _, _ = model.rollout(validation["inputs"])
+        validation_noise = rollout.neural_noise
+        validation_prediction, _, _ = model.rollout(
+            validation["inputs"],
+            initial_state=validation_initial_state,
+            neural_noise_mean=(
+                validation_noise.mean
+                if rollout.validation.apply_neural_noise
+                else 0.0
+            ),
+            neural_noise_std=(
+                validation_noise.std
+                if rollout.validation.apply_neural_noise
+                else 0.0
+            ),
+            generator=rollout_generators["neural_noise_validation"],
+        )
         validation_loss = _masked_mse(
             validation_prediction,
             validation["target"],
@@ -335,17 +626,32 @@ def _measure_step(
         behavior_metrics = task.evaluate_prediction(
             validation_prediction.detach().cpu().numpy(), validation_batch
         )
-        parameter_diagnostics = _parameter_diagnostics(model)
-    return {
-        "epoch": epoch,
-        "learning_rate": float(optimizer.param_groups[0]["lr"]),
-        "train_loss": float(train_loss.detach().cpu()),
-        "validation_loss": float(validation_loss.cpu()),
-        **behavior_metrics,
-        "recurrent_gradient_norm": recurrent_gradient_norm,
-        "total_gradient_norm": total_gradient_norm,
-        **parameter_diagnostics,
-    }
+    result.update(
+        {
+            "validation_loss": float(validation_loss.cpu()),
+            **behavior_metrics,
+            "validation_seconds": time.perf_counter() - validation_started,
+        }
+    )
+    return result
+
+
+def _sample_context_initial_state(
+    model: Rank2CTRNN,
+    *,
+    batch_size: int,
+    initial_state: InitialStateConfig,
+    enabled: bool,
+    generator: torch.Generator,
+) -> Tensor | None:
+    if not enabled:
+        return None
+    return model.sample_initial_state(
+        batch_size,
+        mean=initial_state.mean,
+        std=initial_state.std,
+        generator=generator,
+    )
 
 
 def _torch_batch(
@@ -404,35 +710,45 @@ def _parameter_diagnostics(model: Rank2CTRNN) -> dict[str, float]:
     r_m = torch.linalg.qr(model.m, mode="reduced").R
     r_n = torch.linalg.qr(model.n, mode="reduced").R
     singular_values = torch.linalg.svdvals(r_m @ r_n.T)
-    return {
+    diagnostics = {
         "m_norm": float(torch.linalg.vector_norm(model.m).cpu()),
         "n_norm": float(torch.linalg.vector_norm(model.n).cpu()),
         "w_norm": float(torch.linalg.vector_norm(singular_values).cpu()),
-        "singular_value_1": float(singular_values[0].cpu()),
-        "singular_value_2": float(singular_values[1].cpu()),
     }
+    diagnostics.update(
+        {
+            f"singular_value_{index + 1}": float(value.cpu())
+            for index, value in enumerate(singular_values)
+        }
+    )
+    return diagnostics
 
 
 def _checkpoint_payload(
     model: Rank2CTRNN,
     optimizer: torch.optim.Optimizer,
     train_rng: np.random.Generator,
+    rollout_generators: Mapping[str, torch.Generator],
     config: TrainConfig,
-    history: Sequence[dict[str, float | int]],
+    history: Sequence[dict[str, float | int | None]],
     resolved_config: Mapping[str, Any],
     epoch: int,
 ) -> dict:
     return {
-        "format_version": 1,
+        "format_version": 2,
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "train_config": config.__dict__,
+        "train_config": asdict(config),
         "resolved_config": dict(resolved_config),
         "metrics": dict(history[-1]),
         "rng_state": {
             "task_train": train_rng.bit_generator.state,
             "torch_cpu": torch.random.get_rng_state(),
+            **{
+                f"rollout_{name}": generator.get_state()
+                for name, generator in rollout_generators.items()
+            },
         },
     }
 
@@ -441,8 +757,9 @@ def _save_epoch_checkpoint(
     model: Rank2CTRNN,
     optimizer: torch.optim.Optimizer,
     train_rng: np.random.Generator,
+    rollout_generators: Mapping[str, torch.Generator],
     config: TrainConfig,
-    history: Sequence[dict[str, float | int]],
+    history: Sequence[dict[str, float | int | None]],
     resolved_config: Mapping[str, Any],
     run_dir: Path,
     epoch: int,
@@ -452,6 +769,7 @@ def _save_epoch_checkpoint(
             model,
             optimizer,
             train_rng,
+            rollout_generators,
             config,
             history,
             resolved_config,
@@ -461,8 +779,123 @@ def _save_epoch_checkpoint(
     )
 
 
+def _restore_training_state(
+    *,
+    payload: Mapping[str, Any],
+    model: Rank2CTRNN,
+    optimizer: torch.optim.Optimizer,
+    train_rng: np.random.Generator,
+    rollout_generators: Mapping[str, torch.Generator],
+    target_epoch: int,
+) -> int:
+    """Restore every state that can influence subsequent optimization."""
+    required = {"epoch", "model_state", "optimizer_state", "rng_state"}
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            "Resume checkpoint is missing: " + ", ".join(sorted(missing))
+        )
+    epoch = int(payload["epoch"])
+    if epoch < 0 or epoch > target_epoch:
+        raise ValueError(
+            f"Resume checkpoint epoch {epoch} is outside target range 0..{target_epoch}"
+        )
+    rng_state = payload["rng_state"]
+    if not isinstance(rng_state, Mapping):
+        raise ValueError("Resume checkpoint rng_state must be a mapping")
+    required_rng = {"task_train", "torch_cpu"} | {
+        f"rollout_{name}" for name in rollout_generators
+    }
+    missing_rng = required_rng - set(rng_state)
+    if missing_rng:
+        raise ValueError(
+            "Resume checkpoint is missing RNG streams: "
+            + ", ".join(sorted(missing_rng))
+        )
+
+    model.load_state_dict(payload["model_state"])
+    optimizer.load_state_dict(payload["optimizer_state"])
+    train_rng.bit_generator.state = rng_state["task_train"]
+    torch.random.set_rng_state(rng_state["torch_cpu"])
+    for name, generator in rollout_generators.items():
+        generator.set_state(rng_state[f"rollout_{name}"])
+    return epoch
+
+
+def _read_metrics_for_resume(
+    path: Path, *, checkpoint_epoch: int
+) -> tuple[list[dict[str, float | int | None]], int]:
+    """Validate metrics and discard rows newer than the restored checkpoint."""
+    if not path.is_file():
+        raise ValueError(f"Cannot resume without metrics.csv: {path}")
+    with path.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames is None:
+            raise ValueError("metrics.csv has no header")
+        fieldnames = list(reader.fieldnames)
+        raw_rows = list(reader)
+    if not raw_rows:
+        raise ValueError("metrics.csv has no data rows")
+    try:
+        epochs = [int(row["epoch"]) for row in raw_rows]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("metrics.csv has invalid epoch values") from error
+    if epochs != sorted(set(epochs)):
+        raise ValueError("metrics.csv epochs must be strictly increasing")
+
+    kept = [row for row, epoch in zip(raw_rows, epochs) if epoch <= checkpoint_epoch]
+    if not kept or int(kept[-1]["epoch"]) != checkpoint_epoch:
+        raise ValueError(
+            "metrics.csv does not contain the selected resume checkpoint epoch "
+            f"{checkpoint_epoch}"
+        )
+    discarded = len(raw_rows) - len(kept)
+    if discarded:
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(kept)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return [_coerce_metric_row(row) for row in kept], discarded
+
+
+def _coerce_metric_row(
+    row: Mapping[str, str]
+) -> dict[str, float | int | None]:
+    result: dict[str, float | int | None] = {}
+    for key, value in row.items():
+        if value == "":
+            result[key] = None
+        elif key in {"epoch", "validation_ran"}:
+            result[key] = int(value)
+        else:
+            result[key] = float(value)
+    return result
+
+
+def _existing_epoch_checkpoint_paths(
+    run_dir: Path, *, maximum_epoch: int
+) -> dict[int, Path]:
+    paths: dict[int, Path] = {}
+    checkpoint_dir = run_dir / "checkpoints"
+    for path in checkpoint_dir.glob("epoch-*.pt"):
+        try:
+            epoch = int(path.stem.removeprefix("epoch-"))
+        except ValueError:
+            continue
+        if epoch <= maximum_epoch:
+            paths[epoch] = path
+    return dict(sorted(paths.items()))
+
+
 def _append_metric(
-    path: Path, row: Mapping[str, float | int], *, create: bool
+    path: Path, row: Mapping[str, float | int | None], *, create: bool
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = "w" if create else "a"
@@ -474,6 +907,42 @@ def _append_metric(
         writer.writerow(row)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _log_training_progress(
+    *,
+    logger: Any,
+    row: Mapping[str, float | int | None],
+    epoch: int,
+    eta_seconds: float,
+) -> None:
+    validation_loss = row.get("validation_loss")
+    if validation_loss is None:
+        validation_summary = "validation=skipped"
+    else:
+        behavior = " ".join(
+            f"{key.removeprefix('validation_')}={float(value):.3g}"
+            for key, value in row.items()
+            if key.startswith("validation_")
+            and key
+            not in {"validation_loss", "validation_ran", "validation_seconds"}
+            and value is not None
+        )
+        validation_summary = f"validation_loss={float(validation_loss):.6g}"
+        if behavior:
+            validation_summary += f" {behavior}"
+    logger.info(
+        "step=%d train_loss=%.6g %s train_seconds=%.3fs "
+        "validation_seconds=%.3fs epoch_seconds=%.3fs elapsed=%.1fs eta=%s",
+        epoch,
+        float(row["train_loss"]),
+        validation_summary,
+        float(row["train_seconds"]),
+        float(row["validation_seconds"]),
+        float(row["epoch_seconds"]),
+        float(row["elapsed_seconds"]),
+        _format_duration(eta_seconds),
+    )
 
 
 def _median_seconds(values: Sequence[float]) -> float:

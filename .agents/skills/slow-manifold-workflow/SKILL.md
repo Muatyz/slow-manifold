@@ -78,23 +78,38 @@ figures/
 - metadata 记录代码版本、环境、设备、dtype 和输入数据/生成规则。
 - checkpoint 保存 model、optimizer、epoch/step、metrics、config 和 RNG states。
 - checkpoint 至少包括 initial、periodic、best 和 final；写入应可安全恢复。
+- resume 必须使用根 `config.yaml` 的冻结 task/model/train 配置；恢复 model、
+  optimizer、task/rollout RNG 与累计 metrics。若 metrics 比最新完整 checkpoint
+  更靠前，只能原子截断 checkpoint 之后的尾部行再继续，并在 `run.log` 与
+  `status.yaml` 记录恢复来源；不得把 resume 变成静默覆盖或训练参数修改入口。
 - seed 由配置控制，并为 task、model、training 和 analysis 建立可复现的独立 RNG。
 - 已存在的 run 不得静默覆盖；resume 与新建 run 必须可区分。
 - run identity 由 resolved `task/model/train` 的 canonical fingerprint 与 seed 构成：`runs/<name>/<condition>--cfg-<fingerprint>/seed-<seed>`。
 - `identity.label_fields` 只声明可读标签所引用的真实配置路径；例如 `lr: train.optimizer.learning_rate`。标签不参与唯一性判断，完整训练配置指纹才是权威标识。
 - 修改 learning rate 等训练条件必须修改 component/experiment override；不得只改目录名。相同训练配置与 seed 继续拒绝覆盖。
+- stochastic rollout 由 `train.rollout` 单点定义：初态为 `tanh_normal`，neural noise 为逐 Euler step、`tanh` 内部的 `activation_input` Gaussian noise。缺失该区块的历史配置按两个 `std=0` 解析。train/validation 的 initial-state 与 neural-noise RNG 相互独立并写入 checkpoint；确定性 vector field/Jacobian 不采样 noise。
 
-`figures/latent_dynamics/` 保存同一 aligned κ 网格上的 vector field/Jacobian 双栏 snapshots 与同步 MP4。`figures/latent_vector_field/` 和 `figures/latent_jacobian/` 保留兼容性独立图。三者共享 analysis 的网格、范围和输入条件，显示参数由 visualization 配置控制。
+`figures/latent_dynamics/` 是统一的动力学图入口。rank-2 保存同一 aligned κ 网格上的 vector field/Jacobian 双栏 snapshots 与可选同步 MP4；`figures/latent_vector_field/` 和 `figures/latent_jacobian/` 保留兼容性独立图。rank≥3 不画 3-D vector field，而保存 trajectories、sampled low-q region 与 near-zero spectral-abscissa region 三栏 3-D 图；高维 trajectory 以颜色和线型编码任务阶段，以终点 marker 编码任务条件。K=3 使用 exact κ 三坐标；K>3（含 K=4）用 task-trajectory κ states 的 PC1–3 显示，但 q、flow 与 Jacobian 必须在完整 K 维 exact latent space 计算。低 q/near-zero 邻域样本只作描述性候选，不得直接标作 slow point、ghost 或 slow manifold。
 
-task trajectory 使用正交视觉编码：颜色表示任务条件（Task A 的 short/long；Task B 的 interval `T`），线型表示任务阶段——实线为 S1→S2 interval encoding，虚线为 S2→Go delay，点划线为 Go→target response onset 的 timing/reproduction，点线为 response。S1 前基线仅用细透明线显示。snapshot、独立图和 MP4 必须复用这一语义。
+task trajectory 使用正交视觉编码：颜色表示任务条件（Task A 使用蓝/橙区分 short/long；Task B 使用 plasma 编码 interval `T`），线型表示任务阶段——实线为 S1→S2 interval encoding，虚线为 S2→Go delay，点划线为 Go→target response onset 的 timing/reproduction，点线为 response。轨迹使用白色描边，以同时避开 viridis speed 与 coolwarm Jacobian 背景；实际 `u≠0` 的 cue-driven 位移段覆盖为黄线加黑色描边。`trajectory_line_width` 统一缩放主线、基线、cue overlay、描边与终点 marker。S1 前基线仅用细透明线显示。snapshot、独立图和启用时的 MP4 必须复用这一语义。
 
 κ-plane Jacobian map 展示 `max Re(λ(J_κ))` 的描述性采样。speed minima 先由八邻域网格筛查，再连续最小化 `q=1/2||τF_κ||²`；分类阈值、Hessian、Jacobian 和收敛状态必须保存在 structured diagnostics。latent transverse-stable slow point 只标记为 `G*` candidate；未经 full-state 与 task-relevance 验证，不得表述为 ghost mechanism、slow manifold 或 bifurcation。
 
 decision band 染色的语义约定（与 Dinc 原文一致，勿把“模糊区”和“确定区”染反）：readout `y=tanh(z)`，**decision band 是决策模糊区** `|z|≤w`（显示阈值 `|y|≤tanh(w)`），即输出介于两类明确输出之间、尚未 commit 的区域；带内按偏向分半染色：`z∈(−w,0)`（输出为负，偏向 `−1`）红、`z∈(0,w)`（输出为正，偏向 `+1`）绿。`|z|>w` 为已明确输出 `±1` 的区域，保持速度场原状不染色。半宽 `w` 来自 visualization 配置 `decision_band_logit_half_width`（默认 1，即 Dinc 的 logit±1 约定），`w=0` 时退化为只剩决策边界。看 trajectory 落在 band 哪一侧/是否穿出带外即可读输出倾向。`representative_outputs` 面板同样叠加该 band 两半作参考。
 
-可视化与训练解耦：`uv run slow visualize --run <run_dir>` 可从已有 run 的 checkpoints/metrics 只重算 latent dynamics 并重绘 figures，不重新训练（override `coordinate_bounds`/`grid_points`/`arrow_stride`/`representative_epochs` 时按需重算，并在 `diagnostics/visualize_rerun.yaml` 留下 override 痕迹）。无 override 时复用已存 `diagnostics/latent_dynamics.npz`。
+可视化与训练解耦：根 `config.yaml` 是不可修改的训练记录；`diagnostics/config.yaml` 与 `figures/config.yaml` 保存最近一次成功阶段的完整 resolved component、来源和指纹。`uv run slow visualize --run <run_dir>` 固定使用原 run 的 task/model/checkpoints/metrics，默认从 run 所记录的 experiment source 重新解析当前 analysis/visualization；`--config-source original` 使用训练启动值，`last` 使用最近成功阶段值，`--experiment` 可显式替换 current recipe。CLI override 优先级最高。analysis 指纹变化或 structured diagnostics 不完整时重算，否则复用；重绘不得修改根 `config.yaml`。
+
+静态 PNG 使用 visualization 的 `snapshot_dpi`，MP4 使用独立的 `movie_dpi`；
+`render_movies` 默认关闭，只有明确需要研究 learning movie 的 experiment 才开启；
+关闭视频不得跳过 structured diagnostics 或 representative PNG。历史配置缺少
+`render_movies` 时按旧行为开启；仅有 `vector_field_dpi` 时，将其同时作为两种
+DPI 的兼容 fallback。
+
+representative checkpoints 在训练后由 analysis 规则从 `metrics.csv` 与实际 checkpoints 选择，结果与判据写入 `diagnostics/checkpoint_selection.yaml`；配置只保存规则，不预填自动模式的 epoch。罗马数字只表示展示顺序，角色才承载语义；`abrupt`、`quasi_plateau` 与 `mature` 均为描述性标签，不等同于机制、optimum 或“已学会”。`--representative-epochs` 提供可追溯的人工替换。selection 不影响 latent grid/Jacobian 指纹，单独改选帧不得触发不必要的动力学重算。
 
 分析坐标范围：显式 `coordinate_bounds` 优先；为 `null` 时由 trajectory 推导，并在 grid-minimum 候选贴近网格边缘（慢结构可能被截断）时按 `bounds_expansion_fraction`/`max_bounds_expansions` 自动向外扩张；`coordinate_bounds_source` 与最终范围写入 `latent_dynamics.yaml`。
+
+κ 平面形状由 analysis 配置 `square_coordinate_bounds` 控制；为 `true` 时围绕中心扩展较短轴，不裁剪、不拉伸。`grid_points` 是每轴共同采样数，同时决定 speed/Jacobian 色块分辨率；`arrow_stride` 只控制 quiver 箭头抽样，不改变诊断网格。
 
 动力学诊断还应记录 `F` 的时间尺度约定、`q` 的归一化、输入条件 `u`、搜索初值、阈值、去重容差及 Jacobian 方法。
 
@@ -103,7 +118,7 @@ decision band 染色的语义约定（与 Dinc 原文一致，勿把“模糊区
 每个 run 在根目录维护统一的 `run.log`，通过项目级 logger（`src/slow_manifold/utils/logging.py`）同时输出到 terminal 与该文件；业务模块通过 `get_logger(phase)` 记录，禁止自行使用独立 `print` 作为主要状态输出。
 
 - `run.log`：记录 run/stage 起止、周期性训练进度、checkpoint、warning、异常与 traceback 等人类可读事件；每条记录带 phase 标签。
-- `metrics.csv`：update 级数值指标的唯一结构化来源，可记录 `epoch_seconds` 与累计 `elapsed_seconds`；不要在 run.log 中重复完整 metrics 行。
+- `metrics.csv`：update 级数值指标的唯一结构化来源，记录 `train_seconds`、`validation_seconds`、`epoch_seconds` 与累计 `elapsed_seconds`；validation 可按 `train.validation_every` 稀疏执行，非验证行的 validation 字段留空，不得复用旧值。epoch 0、final 与所有保存 checkpoint 的 epoch 必须验证。
 - `status.yaml`：记录 `running/complete/failed/interrupted`、起止时间、总耗时与失败原因摘要（`error.type`/`message`、`last_step`）；完整 traceback 仅写入 run.log。
 - 默认 `INFO`，仅按 `log_every` 输出训练进度；DEBUG 可配置但默认关闭。
 - ETA 使用最近若干 step 的 wall-clock 滚动中位数估算；普通计时不额外执行 CUDA synchronization。

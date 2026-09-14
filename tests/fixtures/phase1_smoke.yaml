@@ -24,14 +24,18 @@ overrides:
     checkpoint:
       every: 1
   analysis:
-    representative_epochs: [0, 1]
+    representative_selection:
+      mode: manual
+      manual_epochs: [0, 1]
     grid_points: 7
   visualization:
-    training_curves_figure_size: [4.0, 3.0]
-    outputs_panel_width: 2.0
-    outputs_panel_height: 1.5
+    training_curves_figure_size: [5.0, 4.0]
+    outputs_panel_width: 4.0
+    outputs_panel_height: 2.0
     vector_field_figure_size: [3.0, 3.0]
-    vector_field_dpi: 50
+    snapshot_dpi: 80
+    movie_dpi: 50
+    render_movies: true
     movie_fps: 2
     movie_codec: libx264
     arrow_stride: 2

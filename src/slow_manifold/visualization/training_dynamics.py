@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import matplotlib
 import imageio_ffmpeg
@@ -12,19 +12,25 @@ import numpy as np
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt  # noqa: E402
+from matplotlib import patheffects  # noqa: E402
 from matplotlib.animation import FFMpegWriter  # noqa: E402
 from matplotlib.cm import ScalarMappable  # noqa: E402
 from matplotlib.colors import Normalize, to_rgba  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
-# Decision-side colors shared by every figure: class -1 / short (T < T_c) is
-# red, class +1 / long (T > T_c) is green, mirroring the Dinc-style panels.
-# The colors also tint the two halves of the decision band (the ambiguous,
-# un-committed region |logit| <= w): the lower half (output < 0, leaning -1)
-# is red and the upper half (output > 0, leaning +1) is green.
+# Output and decision-band colors: class -1 / short (T < T_c) is red and
+# class +1 / long (T > T_c) is green, mirroring the Dinc-style panels. The
+# trajectory overlay uses a separate palette below to remain visible on maps.
 _CLASS_SHORT_COLOR = "tab:red"
 _CLASS_LONG_COLOR = "tab:green"
+# Trajectories use a separate colorblind-safe palette and a white halo so
+# they remain legible over both viridis speed maps and coolwarm Jacobian maps.
+_TRAJECTORY_SHORT_COLOR = "#0072B2"
+_TRAJECTORY_LONG_COLOR = "#E69F00"
+_REPRODUCTION_TRAJECTORY_CMAP = "plasma"
+_CUE_TRAJECTORY_COLOR = "#F0E442"
+_DEFAULT_TRAJECTORY_LINE_WIDTH = 1.5
 # Default decision-band half-width in readout-logit units (Dinc convention:
 # the band spans logits (-1, 1), i.e. sigma(-1)..sigma(1) for a sigmoid
 # readout).  States inside the band are "not yet committed"; states outside
@@ -41,6 +47,30 @@ _TRAJECTORY_PHASE_LINESTYLES = {
     "post_go_timing": "-.",
     "response": ":",
 }
+_HIGH_DIMENSIONAL_PHASE_COLORS = {
+    "interval_encoding": "#0072B2",
+    "delay": "#D55E00",
+    "post_go_timing": "#009E73",
+    "response": "#CC79A7",
+}
+
+
+def resolve_dpi_settings(config: Mapping[str, Any]) -> tuple[int, int]:
+    """Resolve PNG/movie DPI while preserving legacy config compatibility."""
+    legacy = int(config.get("vector_field_dpi", 150))
+    snapshot_dpi = int(config.get("snapshot_dpi", legacy))
+    movie_dpi = int(config.get("movie_dpi", snapshot_dpi))
+    if snapshot_dpi <= 0 or movie_dpi <= 0:
+        raise ValueError("snapshot_dpi and movie_dpi must be positive")
+    return snapshot_dpi, movie_dpi
+
+
+def resolve_render_movies(config: Mapping[str, Any]) -> bool:
+    """Resolve the configured movie switch with historical compatibility."""
+    value = config.get("render_movies", True)
+    if not isinstance(value, bool):
+        raise ValueError("render_movies must be a boolean")
+    return value
 
 
 def _band_output_edge(logit_half_width: float) -> float:
@@ -57,31 +87,90 @@ def _class_color(class_value: int) -> str:
     return _CLASS_LONG_COLOR if class_value == 1 else _CLASS_SHORT_COLOR
 
 
+def _trajectory_class_color(class_value: int) -> str:
+    return (
+        _TRAJECTORY_LONG_COLOR
+        if class_value == 1
+        else _TRAJECTORY_SHORT_COLOR
+    )
+
+
+def _trajectory_path_effects(line_width: float):
+    if line_width <= 0:
+        raise ValueError("trajectory_line_width must be positive")
+    return (
+        patheffects.Stroke(
+            linewidth=2.1 * line_width,
+            foreground="white",
+            alpha=0.9,
+        ),
+        patheffects.Normal(),
+    )
+
+
+def _cue_line_width(trajectory_line_width: float) -> float:
+    return 1.45 * trajectory_line_width
+
+
+def _cue_path_effects(trajectory_line_width: float):
+    cue_width = _cue_line_width(trajectory_line_width)
+    return (
+        patheffects.Stroke(
+            linewidth=1.75 * cue_width,
+            foreground="black",
+            alpha=0.9,
+        ),
+        patheffects.Normal(),
+    )
+
+
 def plot_training_curves(
     metrics_path: str | Path,
     output_path: str | Path,
     *,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None = None,
     figure_size: Sequence[float],
+    loss_y_scale: str = "log",
+    dpi: int = 150,
 ) -> Path:
     """Plot loss and gradient norms against epoch on aligned panels."""
     rows = _read_metrics(metrics_path)
     epochs = np.array([int(row["epoch"]) for row in rows])
     train_loss = np.array([float(row["train_loss"]) for row in rows])
-    validation_loss = np.array([float(row["validation_loss"]) for row in rows])
+    validation_samples = [
+        (int(row["epoch"]), float(row["validation_loss"]))
+        for row in rows
+        if row.get("validation_loss", "").strip()
+    ]
+    if not validation_samples:
+        raise ValueError("metrics contain no validation_loss samples")
+    validation_epochs = np.asarray(
+        [epoch for epoch, _ in validation_samples], dtype=np.int64
+    )
+    validation_loss = np.asarray(
+        [loss for _, loss in validation_samples], dtype=np.float64
+    )
     recurrent_gradient = np.array(
         [float(row["recurrent_gradient_norm"]) for row in rows]
     )
     total_gradient = np.array([float(row["total_gradient_norm"]) for row in rows])
+    _validate_y_scale(loss_y_scale, (train_loss, validation_loss), name="loss")
 
     figure, axes = plt.subplots(
         2, 1, figsize=tuple(figure_size), sharex=True, constrained_layout=True
     )
-    axes[0].semilogy(epochs, train_loss, label="train loss", color="black")
-    axes[0].semilogy(
-        epochs, validation_loss, label="validation loss", color="tab:blue"
+    axes[0].plot(epochs, train_loss, label="train loss", color="black")
+    axes[0].plot(
+        validation_epochs,
+        validation_loss,
+        label="validation loss",
+        color="tab:blue",
     )
-    axes[0].set_ylabel("masked MSE")
+    axes[0].set_yscale(loss_y_scale)
+    axes[0].set_ylabel(
+        "masked MSE" if loss_y_scale == "linear" else "masked MSE (log scale)"
+    )
     axes[0].legend()
     axes[1].semilogy(
         epochs,
@@ -103,12 +192,38 @@ def plot_training_curves(
         axis.grid(alpha=0.25)
         for epoch in representative_epochs:
             axis.axvline(epoch, color="0.65", linewidth=0.8, linestyle=":")
+    for epoch in representative_epochs:
+        label = (representative_labels or {}).get(int(epoch))
+        if label:
+            axes[0].text(
+                epoch,
+                0.98,
+                label,
+                transform=axes[0].get_xaxis_transform(),
+                rotation=90,
+                va="top",
+                ha="right",
+                fontsize=7,
+                color="0.3",
+            )
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
+
+
+def _validate_y_scale(
+    scale: str, series: Sequence[np.ndarray], *, name: str
+) -> None:
+    if scale not in {"linear", "log"}:
+        raise ValueError(f"{name}_y_scale must be 'linear' or 'log'")
+    values = np.concatenate(tuple(np.ravel(values) for values in series))
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} values must be finite")
+    if scale == "log" and np.any(values <= 0):
+        raise ValueError(f"{name} values must be positive for a log y-axis")
 
 
 def plot_representative_outputs(
@@ -116,18 +231,20 @@ def plot_representative_outputs(
     output_path: str | Path,
     *,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None = None,
     dt: float,
     panel_width: float,
     panel_height: float,
     decision_band_logit_half_width: float = _DECISION_BAND_LOGIT_HALF_WIDTH,
     response_threshold: float = 0.5,
+    dpi: int = 150,
 ) -> Path:
     """Compare network and target outputs at selected epochs.
 
     When the diagnostics carry the input waveforms, each trial gets an extra
     schematic strip on top (Ramesan Fig. 1a style): the S1/S2/Go square-wave
-    pulses as black step lines, one band per channel.  The output panels below
-    share that trial's time axis.  Runs whose stored diagnostics predate the
+    pulses as a black step line on one shared cue channel. The output panels
+    below share that trial's time axis. Runs whose stored diagnostics predate the
     ``inputs`` field fall back to output-only panels.  A translucent band
     marks the readout-logit decision band (Dinc convention).
     """
@@ -158,11 +275,13 @@ def plot_representative_outputs(
             intervals=intervals,
             response_steps=response_steps,
             representative_epochs=representative_epochs,
+            representative_labels=representative_labels,
             indices=indices,
             dt=dt,
             panel_width=panel_width,
             panel_height=panel_height,
             response_threshold=response_threshold,
+            dpi=dpi,
         )
     if inputs is not None:
         return _plot_representative_outputs_with_inputs(
@@ -173,6 +292,7 @@ def plot_representative_outputs(
             target=target,
             valid_mask=valid_mask,
             representative_epochs=representative_epochs,
+            representative_labels=representative_labels,
             indices=indices,
             trials=trials,
             n_columns=n_columns,
@@ -180,6 +300,7 @@ def plot_representative_outputs(
             panel_width=panel_width,
             panel_height=panel_height,
             decision_band_logit_half_width=decision_band_logit_half_width,
+            dpi=dpi,
         )
 
     figure, axes = plt.subplots(
@@ -206,7 +327,9 @@ def plot_representative_outputs(
                 band_edge=band_edge,
             )
             if trial == 0:
-                axis.set_title(f"epoch {epoch}")
+                axis.set_title(
+                    _representative_title(epoch, representative_labels)
+                )
             if column == 0:
                 axis.set_ylabel(
                     f"class {_trial_class(target[trial, :, 0]):+d}\noutput"
@@ -222,9 +345,16 @@ def plot_representative_outputs(
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
+
+
+def _representative_title(
+    epoch: int, labels: Mapping[int, str] | None
+) -> str:
+    label = (labels or {}).get(int(epoch))
+    return f"{label}\nepoch {epoch}" if label else f"epoch {epoch}"
 
 
 def _plot_reproduction_outputs(
@@ -237,11 +367,13 @@ def _plot_reproduction_outputs(
     intervals: np.ndarray | None,
     response_steps: np.ndarray | None,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None,
     indices: Sequence[int],
     dt: float,
     panel_width: float,
     panel_height: float,
     response_threshold: float,
+    dpi: int,
 ) -> Path:
     """Task-B output panels without categorization decision-band semantics."""
     trials = target.shape[0]
@@ -301,7 +433,9 @@ def _plot_reproduction_outputs(
             axis.set_ylim(-1.1, 1.1)
             axis.grid(alpha=0.2)
             if trial == 0:
-                axis.set_title(f"epoch {epoch}")
+                axis.set_title(
+                    _representative_title(epoch, representative_labels)
+                )
             if column == 0:
                 label = (
                     f"T={intervals[trial]:g}\noutput"
@@ -314,7 +448,7 @@ def _plot_reproduction_outputs(
     axes[0, 0].legend(fontsize=7, loc="best")
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
 
@@ -328,6 +462,7 @@ def _plot_representative_outputs_with_inputs(
     target: np.ndarray,
     valid_mask: np.ndarray,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None,
     indices: Sequence[int],
     trials: int,
     n_columns: int,
@@ -335,6 +470,7 @@ def _plot_representative_outputs_with_inputs(
     panel_width: float,
     panel_height: float,
     decision_band_logit_half_width: float,
+    dpi: int,
 ) -> Path:
     """Output panels per trial, preceded by a shared input-schematic strip."""
     from matplotlib.gridspec import GridSpec
@@ -384,7 +520,9 @@ def _plot_representative_outputs_with_inputs(
                 band_edge=band_edge,
             )
             if trial == 0:
-                axis.set_title(f"epoch {epoch}")
+                axis.set_title(
+                    _representative_title(epoch, representative_labels)
+                )
             if column == 0:
                 axis.set_ylabel(
                     f"class {_trial_class(target[trial, :length, 0]):+d}\noutput"
@@ -401,7 +539,7 @@ def _plot_representative_outputs_with_inputs(
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
 
@@ -412,12 +550,14 @@ def _draw_input_schematic(
     inputs: np.ndarray,
     time: np.ndarray,
 ) -> None:
-    """Draw S1/S2/Go square-wave pulses as black step lines, one band each."""
-    channel_names = ("S1", "S2", "Go")
+    """Draw the shared scalar S1/S2/Go square-wave input."""
+    if inputs.ndim != 2 or inputs.shape[1] != 1:
+        raise ValueError("timing-task inputs must have one shared cue channel")
+    channel_names = ("cue",)
     amplitude = float(np.max(np.abs(inputs))) if inputs.size else 1.0
     amplitude = max(amplitude, 1e-9)
     band = 1.0
-    for channel, name in enumerate(channel_names):
+    for channel, _name in enumerate(channel_names):
         offset = channel * band
         values = offset + inputs[:, channel] / amplitude * 0.8
         axis.step(time, values, where="post", color="black", linewidth=1.0)
@@ -541,25 +681,28 @@ def render_latent_vector_field_collection(
     output_dir: str | Path,
     *,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None = None,
     speed_floor: float,
     figure_size: Sequence[float],
     dpi: int,
+    movie_dpi: int | None = None,
+    render_movie: bool = True,
     fps: int,
     codec: str,
     arrow_stride: int,
     arrow_color: str = "black",
-    arrow_length_fraction: float = 0.012,
-    arrow_width: float = 0.002,
+    arrow_length_fraction: float = 0.0075,
+    arrow_width: float = 0.0012,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     decision_band_logit_half_width: float = _DECISION_BAND_LOGIT_HALF_WIDTH,
     response_threshold: float = 0.5,
-) -> dict[str, Path]:
+) -> dict[str, Path | list[Path] | None]:
     """Isolated folder with one snapshot per representative epoch + the MP4."""
     with np.load(diagnostics_path) as data:
+        if int(data.get("coordinate_dimension", np.asarray(2))) >= 3:
+            return {"snapshots": [], "movie": None}
         available = {int(epoch) for epoch in data["epochs"]}
-        final_epoch = int(data["epochs"][-1])
     snapshot_epochs = [int(e) for e in representative_epochs if int(e) in available]
-    if final_epoch not in snapshot_epochs:
-        snapshot_epochs.append(final_epoch)
 
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -569,6 +712,7 @@ def render_latent_vector_field_collection(
             diagnostics_path,
             destination / f"epoch-{epoch:06d}.png",
             epoch=epoch,
+            representative_label=(representative_labels or {}).get(epoch),
             speed_floor=speed_floor,
             figure_size=figure_size,
             dpi=dpi,
@@ -576,25 +720,29 @@ def render_latent_vector_field_collection(
             arrow_color=arrow_color,
             arrow_length_fraction=arrow_length_fraction,
             arrow_width=arrow_width,
+            trajectory_line_width=trajectory_line_width,
             decision_band_logit_half_width=decision_band_logit_half_width,
             response_threshold=response_threshold,
         )
         snapshots.append(path)
-    movie = create_latent_vector_field_movie(
-        diagnostics_path,
-        destination / "latent_vector_field.mp4",
-        speed_floor=speed_floor,
-        figure_size=figure_size,
-        dpi=dpi,
-        fps=fps,
-        codec=codec,
-        arrow_stride=arrow_stride,
-        arrow_color=arrow_color,
-        arrow_length_fraction=arrow_length_fraction,
-        arrow_width=arrow_width,
-        decision_band_logit_half_width=decision_band_logit_half_width,
-        response_threshold=response_threshold,
-    )
+    movie = None
+    if render_movie:
+        movie = create_latent_vector_field_movie(
+            diagnostics_path,
+            destination / "latent_vector_field.mp4",
+            speed_floor=speed_floor,
+            figure_size=figure_size,
+            dpi=dpi if movie_dpi is None else movie_dpi,
+            fps=fps,
+            codec=codec,
+            arrow_stride=arrow_stride,
+            arrow_color=arrow_color,
+            arrow_length_fraction=arrow_length_fraction,
+            arrow_width=arrow_width,
+            trajectory_line_width=trajectory_line_width,
+            decision_band_logit_half_width=decision_band_logit_half_width,
+            response_threshold=response_threshold,
+        )
     return {"snapshots": snapshots, "movie": movie}
 
 
@@ -603,30 +751,52 @@ def render_latent_dynamics_collection(
     output_dir: str | Path,
     *,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None = None,
     speed_floor: float,
     figure_size: Sequence[float],
     dpi: int,
+    movie_dpi: int | None = None,
+    render_movie: bool = True,
     fps: int,
     codec: str,
     arrow_stride: int,
     arrow_color: str = "black",
-    arrow_length_fraction: float = 0.012,
-    arrow_width: float = 0.002,
+    arrow_length_fraction: float = 0.0075,
+    arrow_width: float = 0.0012,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     decision_band_logit_half_width: float = _DECISION_BAND_LOGIT_HALF_WIDTH,
     response_threshold: float = 0.5,
     spectral_abscissa_limit: float | None = None,
-) -> dict[str, Path | list[Path]]:
+    max_trajectories: int = 64,
+) -> dict[str, Path | list[Path] | None]:
     """Render synchronized vector-field/Jacobian panels and their MP4."""
+    with np.load(diagnostics_path) as stored:
+        coordinate_dimension = int(
+            stored.get("coordinate_dimension", np.asarray(2))
+        )
+    if coordinate_dimension >= 3:
+        return render_high_dimensional_dynamics_collection(
+            diagnostics_path,
+            output_dir,
+            representative_epochs=representative_epochs,
+            representative_labels=representative_labels,
+            figure_size=figure_size,
+            dpi=dpi,
+            movie_dpi=movie_dpi,
+            render_movie=render_movie,
+            fps=fps,
+            codec=codec,
+            trajectory_line_width=trajectory_line_width,
+            max_trajectories=max_trajectories,
+            spectral_abscissa_limit=spectral_abscissa_limit,
+        )
     data = _load_vector_field_data(diagnostics_path)
     available = {int(epoch) for epoch in data["epochs"]}
-    final_epoch = int(data["epochs"][-1])
     snapshot_epochs = [
         int(epoch)
         for epoch in representative_epochs
         if int(epoch) in available
     ]
-    if final_epoch not in snapshot_epochs:
-        snapshot_epochs.append(final_epoch)
 
     log_speed = _log_speed(data["speed"], speed_floor)
     speed_norm = Normalize(vmin=float(log_speed.min()), vmax=float(log_speed.max()))
@@ -640,6 +810,7 @@ def render_latent_dynamics_collection(
             data=data,
             output_path=destination / f"epoch-{epoch:06d}.png",
             epoch=epoch,
+            representative_label=(representative_labels or {}).get(epoch),
             log_speed=log_speed,
             speed_norm=speed_norm,
             jacobian_norm=jacobian_norm,
@@ -650,30 +821,423 @@ def render_latent_dynamics_collection(
             arrow_color=arrow_color,
             arrow_length_fraction=arrow_length_fraction,
             arrow_width=arrow_width,
+            trajectory_line_width=trajectory_line_width,
             decision_band_logit_half_width=decision_band_logit_half_width,
             response_threshold=response_threshold,
         )
         for epoch in snapshot_epochs
     ]
-    movie = _create_latent_dynamics_movie(
-        data=data,
-        output_path=destination / "latent_dynamics.mp4",
-        log_speed=log_speed,
-        speed_norm=speed_norm,
-        jacobian_norm=jacobian_norm,
-        speed_floor=speed_floor,
-        figure_size=figure_size,
-        dpi=dpi,
-        fps=fps,
-        codec=codec,
-        arrow_stride=arrow_stride,
-        arrow_color=arrow_color,
-        arrow_length_fraction=arrow_length_fraction,
-        arrow_width=arrow_width,
-        decision_band_logit_half_width=decision_band_logit_half_width,
-        response_threshold=response_threshold,
-    )
+    movie = None
+    if render_movie:
+        movie = _create_latent_dynamics_movie(
+            data=data,
+            output_path=destination / "latent_dynamics.mp4",
+            log_speed=log_speed,
+            speed_norm=speed_norm,
+            jacobian_norm=jacobian_norm,
+            speed_floor=speed_floor,
+            figure_size=figure_size,
+            dpi=dpi if movie_dpi is None else movie_dpi,
+            fps=fps,
+            codec=codec,
+            arrow_stride=arrow_stride,
+            arrow_color=arrow_color,
+            arrow_length_fraction=arrow_length_fraction,
+            arrow_width=arrow_width,
+            trajectory_line_width=trajectory_line_width,
+            decision_band_logit_half_width=decision_band_logit_half_width,
+            response_threshold=response_threshold,
+        )
     return {"snapshots": snapshots, "movie": movie}
+
+
+def render_high_dimensional_dynamics_collection(
+    diagnostics_path: str | Path,
+    output_dir: str | Path,
+    *,
+    representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None = None,
+    figure_size: Sequence[float] = (15.0, 5.0),
+    dpi: int = 180,
+    movie_dpi: int | None = None,
+    render_movie: bool = True,
+    fps: int = 5,
+    codec: str = "libx264",
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
+    max_trajectories: int = 64,
+    spectral_abscissa_limit: float | None = None,
+) -> dict[str, Path | list[Path] | None]:
+    """Render 3-D trajectories, sampled low-q regions, and near-zero spectra."""
+    if max_trajectories <= 0:
+        raise ValueError("max_trajectories must be positive")
+    data = _load_vector_field_data(diagnostics_path)
+    if int(data["coordinate_dimension"]) != 3:
+        raise ValueError("high-dimensional display diagnostics must be 3-D")
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    available = {int(epoch) for epoch in data["epochs"]}
+    snapshot_epochs = [
+        int(epoch) for epoch in representative_epochs if int(epoch) in available
+    ]
+    q_values = np.log10(np.maximum(data["neighborhood_q"], np.finfo(float).tiny))
+    q_norm = Normalize(vmin=float(q_values.min()), vmax=float(q_values.max()))
+    spectral_norm = _spectral_abscissa_norm(
+        data["neighborhood_spectral_abscissa"], spectral_abscissa_limit
+    )
+
+    snapshots: list[Path] = []
+    for epoch in snapshot_epochs:
+        frame_index = _epoch_index(data["epochs"], epoch)
+        figure = _high_dimensional_figure(figure_size)
+        _draw_high_dimensional_frame(
+            figure,
+            data=data,
+            frame_index=frame_index,
+            epoch=epoch,
+            representative_label=(representative_labels or {}).get(epoch),
+            q_values=q_values,
+            q_norm=q_norm,
+            spectral_norm=spectral_norm,
+            trajectory_line_width=trajectory_line_width,
+            max_trajectories=max_trajectories,
+        )
+        path = destination / f"epoch-{epoch:06d}.png"
+        figure.savefig(path, dpi=dpi, bbox_inches="tight")
+        plt.close(figure)
+        snapshots.append(path)
+
+    movie_path = None
+    if render_movie:
+        movie_path = destination / "latent_dynamics.mp4"
+        figure = _high_dimensional_figure(figure_size)
+        matplotlib.rcParams["animation.ffmpeg_path"] = imageio_ffmpeg.get_ffmpeg_exe()
+        writer = FFMpegWriter(
+            fps=fps,
+            codec=codec,
+            extra_args=[
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ],
+        )
+        with writer.saving(
+            figure,
+            movie_path,
+            dpi=dpi if movie_dpi is None else movie_dpi,
+        ):
+            for frame_index, epoch in enumerate(data["epochs"]):
+                figure.clear()
+                _draw_high_dimensional_frame(
+                    figure,
+                    data=data,
+                    frame_index=frame_index,
+                    epoch=int(epoch),
+                    representative_label=None,
+                    q_values=q_values,
+                    q_norm=q_norm,
+                    spectral_norm=spectral_norm,
+                    trajectory_line_width=trajectory_line_width,
+                    max_trajectories=max_trajectories,
+                )
+                writer.grab_frame()
+        plt.close(figure)
+    return {"snapshots": snapshots, "movie": movie_path}
+
+
+def _high_dimensional_figure(figure_size: Sequence[float]):
+    return plt.figure(figsize=tuple(figure_size), constrained_layout=True)
+
+
+def _draw_high_dimensional_frame(
+    figure,
+    *,
+    data: Mapping[str, np.ndarray],
+    frame_index: int,
+    epoch: int,
+    representative_label: str | None,
+    q_values: np.ndarray,
+    q_norm: Normalize,
+    spectral_norm: Normalize,
+    trajectory_line_width: float,
+    max_trajectories: int,
+) -> None:
+    axes = [figure.add_subplot(1, 3, index, projection="3d") for index in (1, 2, 3)]
+    title_suffix = (
+        f"{representative_label} — epoch {epoch}"
+        if representative_label
+        else f"epoch {epoch}"
+    )
+    selected_trials = _selected_trajectory_indices(data, max_trajectories)
+    _draw_3d_trajectories(
+        axes[0],
+        data=data,
+        frame_index=frame_index,
+        selected_trials=selected_trials,
+        line_width=trajectory_line_width,
+        alpha=0.75,
+        phase_styles=True,
+    )
+    axes[0].set_title(f"task trajectories\n{title_suffix}")
+
+    for axis in axes[1:]:
+        _draw_3d_trajectories(
+            axis,
+            data=data,
+            frame_index=frame_index,
+            selected_trials=selected_trials,
+            line_width=0.55 * trajectory_line_width,
+            alpha=0.10,
+            phase_styles=False,
+        )
+    coordinates = data["neighborhood_coordinates"][frame_index]
+    low_q = data["neighborhood_low_q_mask"][frame_index]
+    if np.any(low_q):
+        slow_scatter = axes[1].scatter(
+            *coordinates[low_q].T,
+            c=q_values[frame_index, low_q],
+            cmap="viridis_r",
+            norm=q_norm,
+            s=12,
+            alpha=0.85,
+            depthshade=False,
+        )
+        figure.colorbar(
+            slow_scatter,
+            ax=axes[1],
+            shrink=0.58,
+            pad=0.02,
+            label=r"$\log_{10}q$",
+        )
+    else:
+        axes[1].text2D(0.3, 0.5, "no selected samples", transform=axes[1].transAxes)
+    threshold = float(data["neighborhood_low_q_threshold"][frame_index])
+    axes[1].set_title(f"sampled low-q region\nq ≤ {threshold:.2e}")
+
+    near_zero = data["neighborhood_near_zero_mask"][frame_index]
+    spectral = data["neighborhood_spectral_abscissa"][frame_index]
+    if np.any(near_zero):
+        spectrum_scatter = axes[2].scatter(
+            *coordinates[near_zero].T,
+            c=spectral[near_zero],
+            cmap="coolwarm",
+            norm=spectral_norm,
+            s=12,
+            alpha=0.85,
+            depthshade=False,
+        )
+        figure.colorbar(
+            spectrum_scatter,
+            ax=axes[2],
+            shrink=0.58,
+            pad=0.02,
+            label=r"$\max_i\,\mathrm{Re}\,\lambda_i(J_\kappa)$",
+        )
+    else:
+        axes[2].text2D(
+            0.27, 0.5, "no near-zero samples", transform=axes[2].transAxes
+        )
+    axes[2].set_title("near-zero spectral abscissa")
+
+    labels = [str(value) for value in data["coordinate_labels"]]
+    bounds = data["display_bounds"]
+    for axis in axes:
+        axis.set_xlabel(labels[0])
+        axis.set_ylabel(labels[1])
+        axis.set_zlabel(labels[2])
+        axis.set_xlim(*bounds[0])
+        axis.set_ylim(*bounds[1])
+        axis.set_zlim(*bounds[2])
+        axis.set_box_aspect((1, 1, 1))
+        axis.view_init(elev=22, azim=-58)
+    axes[0].legend(
+        handles=_high_dimensional_legend_handles(data, trajectory_line_width),
+        loc="upper left",
+        fontsize=6,
+        frameon=False,
+    )
+
+
+def _selected_trajectory_indices(
+    data: Mapping[str, np.ndarray], maximum: int
+) -> np.ndarray:
+    count = int(data["trajectory"].shape[1])
+    if count <= maximum:
+        return np.arange(count)
+    return np.unique(np.linspace(0, count - 1, maximum, dtype=int))
+
+
+def _draw_3d_trajectories(
+    axis,
+    *,
+    data: Mapping[str, np.ndarray],
+    frame_index: int,
+    selected_trials: np.ndarray,
+    line_width: float,
+    alpha: float,
+    phase_styles: bool,
+) -> None:
+    trajectories = data["trajectory"][frame_index]
+    target = data["trajectory_target"]
+    valid_mask = data["trajectory_valid_mask"]
+    for trial in selected_trials:
+        length = int(valid_mask[trial].sum())
+        points = trajectories[trial, :length]
+        color = _high_dimensional_trajectory_color(data, target, valid_mask, int(trial))
+        if not phase_styles:
+            axis.plot(*points.T, color=color, linewidth=line_width, alpha=alpha)
+            continue
+        s1_step = int(data["trajectory_trial_s1_step"][trial])
+        if s1_step > 0:
+            baseline = points[: min(s1_step + 1, length)]
+            axis.plot(
+                *baseline.T,
+                color="tab:gray",
+                linewidth=0.55 * line_width,
+                alpha=0.35 * alpha,
+            )
+        for phase, start, stop in _high_dimensional_phase_ranges(
+            data, trial=int(trial), length=length
+        ):
+            segment = points[start : stop + 1]
+            if segment.shape[0] >= 2:
+                axis.plot(
+                    *segment.T,
+                    color=_HIGH_DIMENSIONAL_PHASE_COLORS[phase],
+                    linewidth=line_width,
+                    linestyle=_TRAJECTORY_PHASE_LINESTYLES[phase],
+                    alpha=alpha,
+                    path_effects=_trajectory_path_effects(line_width),
+                )
+        for start, stop in _cue_driven_point_ranges(
+            data["trajectory_inputs"][trial, :length]
+        ):
+            segment = points[start:stop]
+            if segment.shape[0] >= 2:
+                axis.plot(
+                    *segment.T,
+                    color=_CUE_TRAJECTORY_COLOR,
+                    linewidth=_cue_line_width(line_width),
+                    alpha=alpha,
+                    path_effects=_cue_path_effects(line_width),
+                    zorder=4,
+                )
+        axis.scatter(
+            *points[-1],
+            color=color,
+            marker=(
+                "o"
+                if _is_reproduction(data)
+                else (
+                    "^"
+                    if _trial_class(target[trial, :length, 0]) > 0
+                    else "v"
+                )
+            ),
+            s=max(8.0, 8.0 * line_width**2),
+            edgecolors="white",
+            linewidths=0.4 * line_width,
+            alpha=alpha,
+            depthshade=False,
+            zorder=5,
+        )
+
+
+def _high_dimensional_phase_ranges(
+    data: Mapping[str, np.ndarray], *, trial: int, length: int
+) -> list[tuple[str, int, int]]:
+    boundaries = (
+        int(data["trajectory_trial_s1_step"][trial]),
+        int(data["trajectory_trial_s2_step"][trial]),
+        int(data["trajectory_trial_go_step"][trial]),
+        int(data["trajectory_trial_response_step"][trial]),
+        length - 1,
+    )
+    return [
+        (phase, max(0, start), min(stop, length - 1))
+        for phase, start, stop in zip(
+            _TRAJECTORY_PHASE_LINESTYLES, boundaries[:-1], boundaries[1:]
+        )
+        if start < length and stop > start
+    ]
+
+
+def _high_dimensional_trajectory_color(
+    data: Mapping[str, np.ndarray],
+    target: np.ndarray,
+    valid_mask: np.ndarray,
+    trial: int,
+):
+    if not _is_reproduction(data):
+        length = int(valid_mask[trial].sum())
+        return _trajectory_class_color(_trial_class(target[trial, :length, 0]))
+    values = data["trajectory_trial_interval"]
+    span = max(float(np.ptp(values)), 1.0)
+    return plt.get_cmap(_REPRODUCTION_TRAJECTORY_CMAP)(
+        (float(values[trial]) - float(values.min())) / span
+    )
+
+
+def _high_dimensional_legend_handles(
+    data: Mapping[str, np.ndarray], line_width: float
+) -> list[Line2D]:
+    if _is_reproduction(data):
+        condition_handles = [
+            Line2D(
+                [],
+                [],
+                marker="o",
+                color="none",
+                markerfacecolor="tab:purple",
+                label="endpoint color: T",
+            )
+        ]
+    else:
+        condition_handles = [
+            Line2D(
+                [],
+                [],
+                marker="v",
+                color="none",
+                markerfacecolor=_TRAJECTORY_SHORT_COLOR,
+                label="short endpoint",
+            ),
+            Line2D(
+                [],
+                [],
+                marker="^",
+                color="none",
+                markerfacecolor=_TRAJECTORY_LONG_COLOR,
+                label="long endpoint",
+            ),
+        ]
+    phase_labels = {
+        "interval_encoding": "interval encoding",
+        "delay": "delay",
+        "post_go_timing": "post-Go timing",
+        "response": "response",
+    }
+    return condition_handles + [
+        Line2D(
+            [],
+            [],
+            color=_HIGH_DIMENSIONAL_PHASE_COLORS[phase],
+            linestyle=style,
+            linewidth=line_width,
+            label=phase_labels[phase],
+        )
+        for phase, style in _TRAJECTORY_PHASE_LINESTYLES.items()
+    ] + [
+        Line2D(
+            [],
+            [],
+            color=_CUE_TRAJECTORY_COLOR,
+            linewidth=_cue_line_width(line_width),
+            label=r"cue on ($u\ne0$)",
+        )
+    ]
 
 
 def _plot_latent_dynamics_snapshot(
@@ -681,6 +1245,7 @@ def _plot_latent_dynamics_snapshot(
     data: Mapping[str, np.ndarray],
     output_path: Path,
     epoch: int,
+    representative_label: str | None,
     log_speed: np.ndarray,
     speed_norm: Normalize,
     jacobian_norm: Normalize,
@@ -691,6 +1256,7 @@ def _plot_latent_dynamics_snapshot(
     arrow_color: str,
     arrow_length_fraction: float,
     arrow_width: float,
+    trajectory_line_width: float,
     decision_band_logit_half_width: float,
     response_threshold: float,
 ) -> Path:
@@ -705,6 +1271,7 @@ def _plot_latent_dynamics_snapshot(
         data=data,
         frame_index=frame_index,
         epoch=epoch,
+        representative_label=representative_label,
         log_speed=log_speed,
         speed_norm=speed_norm,
         jacobian_norm=jacobian_norm,
@@ -713,11 +1280,12 @@ def _plot_latent_dynamics_snapshot(
         arrow_color=arrow_color,
         arrow_length_fraction=arrow_length_fraction,
         arrow_width=arrow_width,
+        trajectory_line_width=trajectory_line_width,
         decision_band_logit_half_width=decision_band_logit_half_width,
         response_threshold=response_threshold,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=dpi)
+    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return output_path
 
@@ -738,6 +1306,7 @@ def _create_latent_dynamics_movie(
     arrow_color: str,
     arrow_length_fraction: float,
     arrow_width: float,
+    trajectory_line_width: float,
     decision_band_logit_half_width: float,
     response_threshold: float,
 ) -> Path:
@@ -777,6 +1346,7 @@ def _create_latent_dynamics_movie(
                 arrow_color=arrow_color,
                 arrow_length_fraction=arrow_length_fraction,
                 arrow_width=arrow_width,
+                trajectory_line_width=trajectory_line_width,
                 decision_band_logit_half_width=decision_band_logit_half_width,
                 response_threshold=response_threshold,
             )
@@ -813,6 +1383,7 @@ def _draw_latent_dynamics_frame(
     data: Mapping[str, np.ndarray],
     frame_index: int,
     epoch: int,
+    representative_label: str | None = None,
     log_speed: np.ndarray,
     speed_norm: Normalize,
     jacobian_norm: Normalize,
@@ -821,9 +1392,15 @@ def _draw_latent_dynamics_frame(
     arrow_color: str,
     arrow_length_fraction: float,
     arrow_width: float,
+    trajectory_line_width: float,
     decision_band_logit_half_width: float,
     response_threshold: float,
 ) -> None:
+    epoch_title = (
+        f"{representative_label} — epoch {epoch}"
+        if representative_label
+        else f"epoch {epoch}"
+    )
     _draw_vector_field_frame(
         axes[0],
         data=data,
@@ -835,16 +1412,28 @@ def _draw_latent_dynamics_frame(
         arrow_color=arrow_color,
         arrow_length_fraction=arrow_length_fraction,
         arrow_width=arrow_width,
+        trajectory_line_width=trajectory_line_width,
         decision_band_logit_half_width=decision_band_logit_half_width,
         response_threshold=response_threshold,
-        title=f"latent vector field — epoch {epoch}",
+        title=f"latent vector field — {epoch_title}",
     )
     _draw_latent_jacobian_frame(
         axes[1],
         data=data,
         frame_index=frame_index,
         norm=jacobian_norm,
-        title=f"Jacobian spectral abscissa — epoch {epoch}",
+        trajectory_line_width=trajectory_line_width,
+        title=f"Jacobian spectral abscissa — {epoch_title}",
+    )
+    _set_latent_figure_legend(
+        axes[0].figure,
+        data=data,
+        frame_index=frame_index,
+        include_vector_field=True,
+        include_jacobian=True,
+        trajectory_line_width=trajectory_line_width,
+        decision_band_logit_half_width=decision_band_logit_half_width,
+        response_threshold=response_threshold,
     )
 
 
@@ -853,17 +1442,19 @@ def render_latent_jacobian_collection(
     output_dir: str | Path,
     *,
     representative_epochs: Sequence[int],
+    representative_labels: Mapping[int, str] | None = None,
     figure_size: Sequence[float],
     dpi: int,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     spectral_abscissa_limit: float | None = None,
 ) -> list[Path]:
     """Render representative spectral-abscissa maps on the aligned grid."""
+    with np.load(diagnostics_path) as stored:
+        if int(stored.get("coordinate_dimension", np.asarray(2))) >= 3:
+            return []
     data = _load_vector_field_data(diagnostics_path)
     available = {int(epoch) for epoch in data["epochs"]}
-    final_epoch = int(data["epochs"][-1])
     snapshot_epochs = [int(e) for e in representative_epochs if int(e) in available]
-    if final_epoch not in snapshot_epochs:
-        snapshot_epochs.append(final_epoch)
 
     spectral_abscissa = data["jacobian_spectral_abscissa"]
     norm = _spectral_abscissa_norm(spectral_abscissa, spectral_abscissa_limit)
@@ -874,8 +1465,10 @@ def render_latent_jacobian_collection(
             diagnostics_path,
             destination / f"epoch-{epoch:06d}.png",
             epoch=epoch,
+            representative_label=(representative_labels or {}).get(epoch),
             figure_size=figure_size,
             dpi=dpi,
+            trajectory_line_width=trajectory_line_width,
             spectral_abscissa_norm=norm,
         )
         for epoch in snapshot_epochs
@@ -887,8 +1480,10 @@ def plot_latent_jacobian_snapshot(
     output_path: str | Path,
     *,
     epoch: int,
+    representative_label: str | None = None,
     figure_size: Sequence[float],
     dpi: int,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     spectral_abscissa_limit: float | None = None,
     spectral_abscissa_norm: Normalize | None = None,
 ) -> Path:
@@ -911,11 +1506,27 @@ def plot_latent_jacobian_snapshot(
         data=data,
         frame_index=frame_index,
         norm=norm,
-        title=f"latent Jacobian spectral abscissa — epoch {int(epoch)}",
+        trajectory_line_width=trajectory_line_width,
+        title=(
+            "latent Jacobian spectral abscissa — "
+            + (
+                f"{representative_label} — epoch {int(epoch)}"
+                if representative_label
+                else f"epoch {int(epoch)}"
+            )
+        ),
+    )
+    _set_latent_figure_legend(
+        figure,
+        data=data,
+        frame_index=frame_index,
+        include_vector_field=False,
+        include_jacobian=True,
+        trajectory_line_width=trajectory_line_width,
     )
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=dpi)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
 
@@ -925,13 +1536,15 @@ def plot_latent_vector_field_snapshot(
     output_path: str | Path,
     *,
     epoch: int,
+    representative_label: str | None = None,
     speed_floor: float,
     figure_size: Sequence[float],
     dpi: int,
     arrow_stride: int,
     arrow_color: str = "black",
-    arrow_length_fraction: float = 0.012,
-    arrow_width: float = 0.002,
+    arrow_length_fraction: float = 0.0075,
+    arrow_width: float = 0.0012,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     decision_band_logit_half_width: float = _DECISION_BAND_LOGIT_HALF_WIDTH,
     response_threshold: float = 0.5,
 ) -> Path:
@@ -958,13 +1571,31 @@ def plot_latent_vector_field_snapshot(
         arrow_color=arrow_color,
         arrow_length_fraction=arrow_length_fraction,
         arrow_width=arrow_width,
+        trajectory_line_width=trajectory_line_width,
         decision_band_logit_half_width=decision_band_logit_half_width,
         response_threshold=response_threshold,
-        title=f"autonomous latent vector field — epoch {int(epoch)}",
+        title=(
+            "autonomous latent vector field — "
+            + (
+                f"{representative_label} — epoch {int(epoch)}"
+                if representative_label
+                else f"epoch {int(epoch)}"
+            )
+        ),
+    )
+    _set_latent_figure_legend(
+        figure,
+        data=data,
+        frame_index=frame_index,
+        include_vector_field=True,
+        include_jacobian=False,
+        trajectory_line_width=trajectory_line_width,
+        decision_band_logit_half_width=decision_band_logit_half_width,
+        response_threshold=response_threshold,
     )
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=dpi)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
 
@@ -980,8 +1611,9 @@ def create_latent_vector_field_movie(
     codec: str,
     arrow_stride: int,
     arrow_color: str = "black",
-    arrow_length_fraction: float = 0.012,
-    arrow_width: float = 0.002,
+    arrow_length_fraction: float = 0.0075,
+    arrow_width: float = 0.0012,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     decision_band_logit_half_width: float = _DECISION_BAND_LOGIT_HALF_WIDTH,
     response_threshold: float = 0.5,
 ) -> Path:
@@ -1019,9 +1651,20 @@ def create_latent_vector_field_movie(
                 arrow_color=arrow_color,
                 arrow_length_fraction=arrow_length_fraction,
                 arrow_width=arrow_width,
+                trajectory_line_width=trajectory_line_width,
                 decision_band_logit_half_width=decision_band_logit_half_width,
                 response_threshold=response_threshold,
                 title=f"autonomous latent vector field — epoch {int(epoch)}",
+            )
+            _set_latent_figure_legend(
+                figure,
+                data=data,
+                frame_index=frame_index,
+                include_vector_field=True,
+                include_jacobian=False,
+                trajectory_line_width=trajectory_line_width,
+                decision_band_logit_half_width=decision_band_logit_half_width,
+                response_threshold=response_threshold,
             )
             writer.grab_frame()
     plt.close(figure)
@@ -1061,6 +1704,7 @@ def _draw_latent_jacobian_frame(
     data: Mapping[str, np.ndarray],
     frame_index: int,
     norm: Normalize,
+    trajectory_line_width: float,
     title: str,
 ) -> None:
     grid_x = data["grid_x"]
@@ -1084,36 +1728,18 @@ def _draw_latent_jacobian_frame(
             linewidths=0.8,
             linestyles="--",
         )
-    _draw_latent_context(axis, data=data, frame_index=frame_index)
+    _draw_latent_context(
+        axis,
+        data=data,
+        frame_index=frame_index,
+        trajectory_line_width=trajectory_line_width,
+    )
     axis.set_xlim(float(grid_x.min()), float(grid_x.max()))
     axis.set_ylim(float(grid_y.min()), float(grid_y.max()))
     axis.set_aspect("equal", adjustable="box")
     axis.set_xlabel(r"aligned $\kappa_1$")
     axis.set_ylabel(r"aligned $\kappa_2$")
     axis.set_title(title)
-    context_legend = axis.legend(
-        handles=[
-            Line2D(
-                [],
-                [],
-                color="black",
-                linestyle="--",
-                label=r"$\max\,\mathrm{Re}(\lambda)=0$",
-            ),
-            *_trajectory_condition_legend_handles(data),
-            *_speed_minimum_legend_handles(data, frame_index),
-        ],
-        loc="upper right",
-        fontsize=7,
-    )
-    axis.add_artist(context_legend)
-    axis.legend(
-        handles=_trajectory_phase_legend_handles(data),
-        loc="lower left",
-        fontsize=7,
-        title="trajectory phase",
-        title_fontsize=7,
-    )
 
 
 def _draw_vector_field_frame(
@@ -1128,6 +1754,7 @@ def _draw_vector_field_frame(
     arrow_color: str,
     arrow_length_fraction: float,
     arrow_width: float,
+    trajectory_line_width: float,
     decision_band_logit_half_width: float,
     response_threshold: float,
     title: str,
@@ -1206,67 +1833,105 @@ def _draw_vector_field_frame(
             grid_x, grid_y, grid_output_frame, levels=[0.0], colors=["white"],
             linewidths=1.0, linestyles="--",
         )
-    _draw_latent_context(axis, data=data, frame_index=frame_index)
+    _draw_latent_context(
+        axis,
+        data=data,
+        frame_index=frame_index,
+        trajectory_line_width=trajectory_line_width,
+    )
     axis.set_xlim(float(grid_x.min()), float(grid_x.max()))
     axis.set_ylim(float(grid_y.min()), float(grid_y.max()))
     axis.set_aspect("equal", adjustable="box")
     axis.set_xlabel(r"aligned $\kappa_1$")
     axis.set_ylabel(r"aligned $\kappa_2$")
     axis.set_title(title)
-    if _is_reproduction(data):
-        region_legend = [
-            Line2D(
-                [],
-                [],
-                color="tab:orange",
-                linestyle=":",
-                label=f"response threshold y={response_threshold:g}",
-            ),
-            *_speed_minimum_legend_handles(data, frame_index),
-        ]
-    else:
-        band_edge = _band_output_edge(decision_band_logit_half_width)
-        band_annotation = (
-            f"$|z|\\leq{decision_band_logit_half_width:g}$ "
-            f"($|y|\\leq{band_edge:.3g}$)"
+
+
+def _set_latent_figure_legend(
+    figure,
+    *,
+    data: Mapping[str, np.ndarray],
+    frame_index: int,
+    include_vector_field: bool,
+    include_jacobian: bool,
+    trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
+    decision_band_logit_half_width: float = _DECISION_BAND_LOGIT_HALF_WIDTH,
+    response_threshold: float = 0.5,
+) -> None:
+    """Place one compact shared legend below the latent-data axes."""
+    for legend in tuple(figure.legends):
+        legend.remove()
+
+    handles: list[Line2D | Patch] = []
+    if include_vector_field:
+        if _is_reproduction(data):
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    color="tab:orange",
+                    linestyle=":",
+                    label=f"response threshold y={response_threshold:g}",
+                )
+            )
+        else:
+            handles.extend(
+                (
+                    Patch(
+                        facecolor=_CLASS_SHORT_COLOR,
+                        alpha=_BAND_TINT_ALPHA,
+                        label=(
+                            f"−1 decision side "
+                            f"(|z|≤{decision_band_logit_half_width:g})"
+                        ),
+                    ),
+                    Patch(
+                        facecolor=_CLASS_LONG_COLOR,
+                        alpha=_BAND_TINT_ALPHA,
+                        label=(
+                            f"+1 decision side "
+                            f"(|z|≤{decision_band_logit_half_width:g})"
+                        ),
+                    ),
+                )
+            )
+    if include_jacobian:
+        values = data["jacobian_spectral_abscissa"][frame_index]
+        if float(values.min()) <= 0.0 <= float(values.max()):
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    color="black",
+                    linestyle="--",
+                    label=r"$\max\,\mathrm{Re}(\lambda)=0$",
+                )
+            )
+    handles.extend(_speed_minimum_legend_handles(data, frame_index))
+    handles.extend(_trajectory_condition_legend_handles(data))
+    handles.extend(
+        _trajectory_phase_legend_handles(
+            data, trajectory_line_width=trajectory_line_width
         )
-        region_legend = [
-            Patch(
-                facecolor=_CLASS_SHORT_COLOR,
-                alpha=_BAND_TINT_ALPHA,
-                label=(
-                    f"decision band, $-1$ side\n(uncommitted, leaning $-1$; "
-                    f"{band_annotation})"
-                ),
-            ),
-            Patch(
-                facecolor=_CLASS_LONG_COLOR,
-                alpha=_BAND_TINT_ALPHA,
-                label=(
-                    f"decision band, $+1$ side\n(uncommitted, leaning $+1$; "
-                    f"{band_annotation})"
-                ),
-            ),
-            *_speed_minimum_legend_handles(data, frame_index),
-        ]
-    region = axis.legend(handles=region_legend, loc="lower left", fontsize=7)
-    axis.add_artist(region)
-    axis.legend(
-        handles=[
-            *_trajectory_condition_legend_handles(data),
-            *_trajectory_phase_legend_handles(data),
-        ],
-        loc="upper right",
+    )
+    figure.legend(
+        handles=handles,
+        loc="outside lower center",
+        ncol=min(4, len(handles)),
         fontsize=7,
-        title="trajectory",
-        title_fontsize=7,
+        frameon=False,
     )
 
 
 def _draw_latent_context(
-    axis, *, data: Mapping[str, np.ndarray], frame_index: int
+    axis,
+    *,
+    data: Mapping[str, np.ndarray],
+    frame_index: int,
+    trajectory_line_width: float,
 ) -> None:
     """Overlay descriptive speed minima and task trajectories."""
+    trajectory_effects = _trajectory_path_effects(trajectory_line_width)
     _draw_speed_minima(axis, data=data, frame_index=frame_index)
     trajectory = data["trajectory"][frame_index]
     target = data["target"]
@@ -1276,7 +1941,13 @@ def _draw_latent_context(
         points = trajectory[trial, :length]
         color = _trajectory_color(data, target, valid_mask, trial)
         if "trial_s1_step" not in data:
-            axis.plot(points[:, 0], points[:, 1], color=color, linewidth=1.5)
+            axis.plot(
+                points[:, 0],
+                points[:, 1],
+                color=color,
+                linewidth=trajectory_line_width,
+                path_effects=trajectory_effects,
+            )
         else:
             s1_step = int(data["trial_s1_step"][trial])
             if s1_step > 0:
@@ -1285,8 +1956,9 @@ def _draw_latent_context(
                     baseline[:, 0],
                     baseline[:, 1],
                     color=color,
-                    linewidth=0.8,
+                    linewidth=0.55 * trajectory_line_width,
                     alpha=0.35,
+                    path_effects=trajectory_effects,
                 )
             for phase, start, stop in _trajectory_phase_ranges(
                 data, trial=trial, length=length
@@ -1298,10 +1970,68 @@ def _draw_latent_context(
                     segment[:, 0],
                     segment[:, 1],
                     color=color,
-                    linewidth=1.5,
+                    linewidth=trajectory_line_width,
                     linestyle=_TRAJECTORY_PHASE_LINESTYLES[phase],
+                    path_effects=trajectory_effects,
                 )
-        axis.scatter(points[-1, 0], points[-1, 1], color=color, s=15, zorder=3)
+        _draw_cue_driven_segments(
+            axis,
+            data=data,
+            trial=trial,
+            points=points,
+            length=length,
+            trajectory_line_width=trajectory_line_width,
+        )
+        axis.scatter(
+            points[-1, 0],
+            points[-1, 1],
+            color=color,
+            edgecolors="white",
+            linewidths=0.45 * trajectory_line_width,
+            s=max(8.0, 8.0 * trajectory_line_width**2),
+            zorder=3,
+        )
+
+
+def _draw_cue_driven_segments(
+    axis,
+    *,
+    data: Mapping[str, np.ndarray],
+    trial: int,
+    points: np.ndarray,
+    length: int,
+    trajectory_line_width: float,
+) -> None:
+    """Overlay state displacements made while the external cue is nonzero."""
+    inputs = data.get("inputs")
+    if inputs is None:
+        return
+    for start, stop in _cue_driven_point_ranges(inputs[trial, :length]):
+        segment = points[start:stop]
+        if segment.shape[0] < 2:
+            continue
+        axis.plot(
+            segment[:, 0],
+            segment[:, 1],
+            color=_CUE_TRAJECTORY_COLOR,
+            linewidth=_cue_line_width(trajectory_line_width),
+            linestyle="-",
+            path_effects=_cue_path_effects(trajectory_line_width),
+            zorder=4,
+        )
+
+
+def _cue_driven_point_ranges(inputs: np.ndarray) -> list[tuple[int, int]]:
+    """Return point slices spanning transitions generated by nonzero inputs."""
+    cue_on = np.any(np.abs(inputs) > 0.0, axis=-1)
+    padded = np.pad(cue_on.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    input_starts = np.flatnonzero(changes == 1)
+    input_stops = np.flatnonzero(changes == -1)
+    return [
+        (max(int(start) - 1, 0), int(stop))
+        for start, stop in zip(input_starts, input_stops)
+    ]
 
 
 def _trajectory_phase_ranges(
@@ -1330,12 +2060,12 @@ def _trajectory_color(
 ):
     if not _is_reproduction(data):
         length = int(valid_mask[trial].sum())
-        return _class_color(_trial_class(target[trial, :length, 0]))
+        return _trajectory_class_color(_trial_class(target[trial, :length, 0]))
     values = data.get("trial_interval")
     if values is None or len(values) < 2:
-        return "tab:blue"
+        return "tab:purple"
     span = max(float(np.ptp(values)), 1.0)
-    return plt.get_cmap("viridis")(
+    return plt.get_cmap(_REPRODUCTION_TRAJECTORY_CMAP)(
         (float(values[trial]) - float(values.min())) / span
     )
 
@@ -1345,12 +2075,16 @@ def _trajectory_condition_legend_handles(
 ) -> list[Line2D]:
     if not _is_reproduction(data):
         return [
-            Line2D([], [], color=_CLASS_SHORT_COLOR, label="short trajectory"),
-            Line2D([], [], color=_CLASS_LONG_COLOR, label="long trajectory"),
+            Line2D(
+                [], [], color=_TRAJECTORY_SHORT_COLOR, label="short trajectory"
+            ),
+            Line2D(
+                [], [], color=_TRAJECTORY_LONG_COLOR, label="long trajectory"
+            ),
         ]
     values = data.get("trial_interval")
     if values is None or len(values) > 6:
-        return [Line2D([], [], color="tab:blue", label="trajectory color: T")]
+        return [Line2D([], [], color="tab:purple", label="trajectory color: T")]
     dummy_target = data["target"]
     valid_mask = data["valid_mask"]
     return [
@@ -1366,6 +2100,8 @@ def _trajectory_condition_legend_handles(
 
 def _trajectory_phase_legend_handles(
     data: Mapping[str, np.ndarray],
+    *,
+    trajectory_line_width: float,
 ) -> list[Line2D]:
     post_go_label = "reproduction" if _is_reproduction(data) else "post-Go timing"
     labels = {
@@ -1374,17 +2110,30 @@ def _trajectory_phase_legend_handles(
         "post_go_timing": post_go_label,
         "response": "response",
     }
-    return [
+    handles = [
         Line2D(
             [],
             [],
             color="black",
             linestyle=linestyle,
-            linewidth=1.5,
+            linewidth=trajectory_line_width,
             label=labels[phase],
         )
         for phase, linestyle in _TRAJECTORY_PHASE_LINESTYLES.items()
     ]
+    if "inputs" in data:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color=_CUE_TRAJECTORY_COLOR,
+                linestyle="-",
+                linewidth=_cue_line_width(trajectory_line_width),
+                path_effects=_cue_path_effects(trajectory_line_width),
+                label=r"cue on ($u\ne0$)",
+            )
+        )
+    return handles
 
 
 def _is_reproduction(data: Mapping[str, np.ndarray]) -> bool:

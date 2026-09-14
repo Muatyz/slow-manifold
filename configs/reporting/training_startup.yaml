@@ -14,8 +14,14 @@ sections:
       - {label: activation, path: model.activation}
   - label: Train
     fields:
+      - {label: loss, path: train.loss.name}
+      - {label: lambda pre-response, path: train.loss.phase_weights.0.lambda}
+      - {label: lambda response, path: train.loss.phase_weights.1.lambda}
       - {label: optimizer, path: train.optimizer.name}
       - {label: learning rate, path: train.optimizer.learning_rate}
       - {label: batch size, path: train.batch_size}
       - {label: updates, path: train.epochs}
+      - {label: validation every, path: train.validation_every}
       - {label: device, path: train.device}
+      - {label: initial state std, path: train.rollout.initial_state.std}
+      - {label: neural noise std, path: train.rollout.neural_noise.std}

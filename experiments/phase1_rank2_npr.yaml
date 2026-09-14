@@ -1,4 +1,4 @@
-name: phase1_rank2_baseline
+name: phase1_rank2_npr # 该 config 用来测试 1e-3 学习率是否会出现 point of no return
 seed: 20260903
 identity:
   label_fields:
@@ -15,6 +15,6 @@ components:
 overrides:
   train:
     optimizer:
-      learning_rate: 1e-4
-    epochs: 400000
+      learning_rate: 1e-3
+    epochs: 40000
     batch_size: 64

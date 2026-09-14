@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ._shared import (
+    PhaseNormalizedLossConfig,
+    SquarePulseStimulusConfig,
     TaskBatch,
     TaskConfigError,
     Trial,
@@ -30,12 +32,8 @@ class IntervalCategorizationConfig:
     name: str
     dt: float
     threshold: float
-    stimulus_waveform: str
-    stimulus_width: float
-    stimulus_amplitude: float
+    stimulus: SquarePulseStimulusConfig
     response_window: float
-    pre_go_loss_weight: float
-    response_loss_weight: float
     splits: dict[str, SplitConfig]
 
     @classmethod
@@ -47,8 +45,6 @@ class IntervalCategorizationConfig:
             "threshold",
             "stimulus",
             "response_window",
-            "pre_go_loss_weight",
-            "response_loss_weight",
             "splits",
         }
         missing = required - set(data)
@@ -63,13 +59,6 @@ class IntervalCategorizationConfig:
         raw_stimulus = data["stimulus"]
         if not isinstance(raw_stimulus, Mapping):
             raise TaskConfigError("stimulus must be a mapping")
-        stimulus_fields = {"waveform", "width", "amplitude"}
-        missing_stimulus = stimulus_fields - set(raw_stimulus)
-        if missing_stimulus:
-            raise TaskConfigError(
-                "Missing stimulus fields: " + ", ".join(sorted(missing_stimulus))
-            )
-
         splits: dict[str, SplitConfig] = {}
         for split_name, raw_split in raw_splits.items():
             if not isinstance(raw_split, Mapping):
@@ -91,12 +80,10 @@ class IntervalCategorizationConfig:
             name=str(data["name"]),
             dt=float(dt),
             threshold=float(data["threshold"]),
-            stimulus_waveform=str(raw_stimulus["waveform"]),
-            stimulus_width=float(raw_stimulus["width"]),
-            stimulus_amplitude=float(raw_stimulus["amplitude"]),
+            stimulus=SquarePulseStimulusConfig.from_mapping(
+                raw_stimulus, dt=dt
+            ),
             response_window=float(data["response_window"]),
-            pre_go_loss_weight=float(data["pre_go_loss_weight"]),
-            response_loss_weight=float(data["response_loss_weight"]),
             splits=splits,
         )
         config.validate()
@@ -105,16 +92,7 @@ class IntervalCategorizationConfig:
     def validate(self) -> None:
         if not self.name:
             raise TaskConfigError("name must not be empty")
-        if self.stimulus_waveform != "square":
-            raise TaskConfigError("Only the 'square' stimulus waveform is supported")
-        if self.stimulus_amplitude <= 0:
-            raise TaskConfigError("stimulus amplitude must be positive")
-        if self.pre_go_loss_weight < 0 or self.response_loss_weight <= 0:
-            raise TaskConfigError(
-                "loss weights must be non-negative and response positive"
-            )
-
-        _to_steps(self.stimulus_width, self.dt, "stimulus.width")
+        self.stimulus.validate(self.dt)
         _to_steps(self.response_window, self.dt, "response_window")
         _to_steps(self.threshold, self.dt, "threshold")
         for split_name, split in self.splits.items():
@@ -137,7 +115,7 @@ class IntervalCategorizationConfig:
             minimum_separation = min(
                 split.short_interval[0], split.long_interval[0], split.delay[0]
             )
-            if self.stimulus_width > minimum_separation:
+            if self.stimulus.width > minimum_separation:
                 raise TaskConfigError(
                     f"stimulus.width causes overlapping cues in split '{split_name}'"
                 )
@@ -146,15 +124,26 @@ class IntervalCategorizationConfig:
 class IntervalCategorizationTask:
     """Generate balanced delayed interval-categorization trials."""
 
-    input_names = ("S1", "S2", "Go")
-
-    def __init__(self, config: IntervalCategorizationConfig, split: str = "train"):
+    def __init__(
+        self,
+        config: IntervalCategorizationConfig,
+        split: str = "train",
+        loss: PhaseNormalizedLossConfig | None = None,
+    ):
         if split not in config.splits:
             available = ", ".join(sorted(config.splits))
             raise TaskConfigError(f"Unknown split '{split}'. Available: {available}")
         self.config = config
         self.split_name = split
         self.split = config.splits[split]
+        self.loss = loss or PhaseNormalizedLossConfig.unit_weights(
+            "pre_response", "response"
+        )
+        self.loss_weights = self.loss.require_phases("pre_response", "response")
+
+    @property
+    def input_names(self) -> tuple[str, ...]:
+        return self.config.stimulus.input_names
 
     def build_trial(self, *, interval: float, delay: float, s1_onset: float) -> Trial:
         """Build one trial from explicit relative timings."""
@@ -169,21 +158,26 @@ class IntervalCategorizationTask:
         class_label = -1 if interval_steps < threshold_steps else 1
         s2_step = s1_step + interval_steps
         go_step = s2_step + delay_steps
-        stimulus_steps = _to_steps(cfg.stimulus_width, cfg.dt, "stimulus.width")
+        stimulus_steps = _to_steps(cfg.stimulus.width, cfg.dt, "stimulus.width")
         response_step = go_step + stimulus_steps
         response_steps = _to_steps(cfg.response_window, cfg.dt, "response_window")
         trial_steps = response_step + response_steps
 
-        inputs = np.zeros((trial_steps, 3), dtype=np.float64)
-        target = np.zeros((trial_steps, 1), dtype=np.float64)
-        loss_mask = np.full(
-            (trial_steps, 1), cfg.pre_go_loss_weight, dtype=np.float64
+        inputs = cfg.stimulus.render(
+            cue_steps=(s1_step, s2_step, go_step),
+            trial_steps=trial_steps,
+            dt=cfg.dt,
         )
-        inputs[s1_step : s1_step + stimulus_steps, 0] = cfg.stimulus_amplitude
-        inputs[s2_step : s2_step + stimulus_steps, 1] = cfg.stimulus_amplitude
-        inputs[go_step : go_step + stimulus_steps, 2] = cfg.stimulus_amplitude
+        target = np.zeros((trial_steps, 1), dtype=np.float64)
+        loss_mask = np.zeros((trial_steps, 1), dtype=np.float64)
         target[response_step:, 0] = class_label
-        loss_mask[response_step:, 0] = cfg.response_loss_weight
+        # Each phase contributes its configured lambda independent of duration.
+        loss_mask[:response_step, 0] = (
+            self.loss_weights["pre_response"] / response_step
+        )
+        loss_mask[response_step:, 0] = (
+            self.loss_weights["response"] / response_steps
+        )
 
         metadata = TrialMetadata(
             s1_step=s1_step,
@@ -234,7 +228,10 @@ class IntervalCategorizationTask:
             raise ValueError("trials must not be empty")
         batch_size = len(trials)
         max_steps = max(trial.metadata.trial_steps for trial in trials)
-        inputs = np.zeros((batch_size, max_steps, 3), dtype=np.float64)
+        inputs = np.zeros(
+            (batch_size, max_steps, self.config.stimulus.input_size),
+            dtype=np.float64,
+        )
         target = np.zeros((batch_size, max_steps, 1), dtype=np.float64)
         loss_mask = np.zeros((batch_size, max_steps, 1), dtype=np.float64)
         valid_mask = np.zeros((batch_size, max_steps), dtype=np.bool_)
@@ -253,7 +250,7 @@ class IntervalCategorizationTask:
             metadata=tuple(trial.metadata for trial in trials),
             dt=self.config.dt,
             input_names=self.input_names,
-            loss_reduction="weighted_mean",
+            loss_reduction="batch_mean",
         )
 
     def evaluate_prediction(

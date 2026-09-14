@@ -1,4 +1,4 @@
-"""Coordinate-aligned rank-2 latent vector fields across checkpoints."""
+"""Low-rank latent dynamics across training checkpoints."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from slow_manifold.models import Rank2CTRNN, Rank2CTRNNConfig
 from slow_manifold.tasks import ConfiguredTask, TaskBatch
 from slow_manifold.training.checkpoint import load_checkpoint
 
+from .checkpoint_selection import RepresentativeSelectionConfig
 from .speed_minima import (
     ClassifiedSpeedMinima,
     SpeedMinimumClassificationConfig,
@@ -26,6 +27,15 @@ class AnalysisConfigError(ValueError):
     """Raised when training-dynamics analysis configuration is invalid."""
 
 
+def _configuration_bool(
+    data: Mapping[str, Any], key: str, *, default: bool
+) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise TypeError(f"{key} must be boolean")
+    return value
+
+
 @dataclass(frozen=True)
 class EvaluationTrialConfig:
     interval: float
@@ -34,18 +44,82 @@ class EvaluationTrialConfig:
 
 
 @dataclass(frozen=True)
+class NeighborhoodSamplingConfig:
+    """Trajectory-neighborhood sampling used when latent rank is at least 3."""
+
+    anchor_count: int = 64
+    samples_per_anchor: int = 8
+    radius_fraction: float = 0.05
+    minimum_radius: float = 1.0e-3
+    low_q_quantile: float = 0.05
+    near_zero_eigenvalue_tolerance: float = 1.0e-2
+    max_plot_points: int = 512
+
+    @classmethod
+    def from_mapping(
+        cls, data: Mapping[str, Any] | None
+    ) -> "NeighborhoodSamplingConfig":
+        values = {} if data is None else dict(data)
+        config = cls(
+            anchor_count=int(values.get("anchor_count", cls.anchor_count)),
+            samples_per_anchor=int(
+                values.get("samples_per_anchor", cls.samples_per_anchor)
+            ),
+            radius_fraction=float(
+                values.get("radius_fraction", cls.radius_fraction)
+            ),
+            minimum_radius=float(
+                values.get("minimum_radius", cls.minimum_radius)
+            ),
+            low_q_quantile=float(
+                values.get("low_q_quantile", cls.low_q_quantile)
+            ),
+            near_zero_eigenvalue_tolerance=float(
+                values.get(
+                    "near_zero_eigenvalue_tolerance",
+                    cls.near_zero_eigenvalue_tolerance,
+                )
+            ),
+            max_plot_points=int(
+                values.get("max_plot_points", cls.max_plot_points)
+            ),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if self.anchor_count <= 0 or self.samples_per_anchor < 0:
+            raise AnalysisConfigError(
+                "neighborhood anchor_count must be positive and "
+                "samples_per_anchor non-negative"
+            )
+        if self.radius_fraction < 0 or self.minimum_radius <= 0:
+            raise AnalysisConfigError("neighborhood sampling radii are invalid")
+        if not 0 < self.low_q_quantile <= 1:
+            raise AnalysisConfigError("low_q_quantile must lie in (0, 1]")
+        if self.near_zero_eigenvalue_tolerance < 0 or self.max_plot_points <= 0:
+            raise AnalysisConfigError(
+                "near-zero tolerance must be non-negative and max_plot_points positive"
+            )
+
+
+@dataclass(frozen=True)
 class AnalysisConfig:
     name: str
     input_condition: tuple[float, ...]
-    representative_epochs: tuple[int, ...]
+    representative_selection: RepresentativeSelectionConfig
     grid_points: int
     coordinate_bounds: tuple[float, float, float, float] | None
+    square_coordinate_bounds: bool
     padding_fraction: float
     bounds_expansion_fraction: float
     max_bounds_expansions: int
     speed_floor: float
     speed_minimum_classification: SpeedMinimumClassificationConfig
     evaluation_trials: tuple[EvaluationTrialConfig, ...]
+    trajectory_count: int
+    trajectory_seed: int
+    neighborhood_sampling: NeighborhoodSamplingConfig
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "AnalysisConfig":
@@ -65,14 +139,26 @@ class AnalysisConfig:
                 )
                 for item in raw_trials
             )
+            selection_mapping = data.get("representative_selection")
+            # A frozen historical run may still carry the former fixed list.
+            # Treat it as an explicit manual selection without keeping that
+            # presentation concern in the latent-dynamics implementation.
+            if selection_mapping is None and "representative_epochs" in data:
+                selection_mapping = {
+                    "mode": "manual",
+                    "manual_epochs": data["representative_epochs"],
+                }
             config = cls(
                 name=str(data["name"]),
                 input_condition=tuple(float(value) for value in data["input_condition"]),
-                representative_epochs=tuple(
-                    int(epoch) for epoch in data["representative_epochs"]
+                representative_selection=RepresentativeSelectionConfig.from_mapping(
+                    selection_mapping
                 ),
                 grid_points=int(data["grid_points"]),
                 coordinate_bounds=bounds,  # type: ignore[arg-type]
+                square_coordinate_bounds=_configuration_bool(
+                    data, "square_coordinate_bounds", default=True
+                ),
                 padding_fraction=float(data["padding_fraction"]),
                 bounds_expansion_fraction=float(
                     data.get("bounds_expansion_fraction", 0.5)
@@ -85,6 +171,11 @@ class AnalysisConfig:
                     )
                 ),
                 evaluation_trials=trials,
+                trajectory_count=int(data.get("trajectory_count", 128)),
+                trajectory_seed=int(data.get("trajectory_seed", 20260914)),
+                neighborhood_sampling=NeighborhoodSamplingConfig.from_mapping(
+                    data.get("neighborhood_sampling")
+                ),
             )
         except (KeyError, TypeError) as error:
             raise AnalysisConfigError(f"Invalid analysis configuration: {error}") from error
@@ -103,10 +194,8 @@ class AnalysisConfig:
             )
         if not self.evaluation_trials:
             raise AnalysisConfigError("evaluation_trials must not be empty")
-        if any(epoch < 0 for epoch in self.representative_epochs):
-            raise AnalysisConfigError("representative_epochs must be non-negative")
-        if len(set(self.representative_epochs)) != len(self.representative_epochs):
-            raise AnalysisConfigError("representative_epochs must be unique")
+        if self.trajectory_count <= 0:
+            raise AnalysisConfigError("trajectory_count must be positive")
         if self.coordinate_bounds is not None:
             if len(self.coordinate_bounds) != 4:
                 raise AnalysisConfigError("coordinate_bounds must have four values")
@@ -120,7 +209,6 @@ class LatentDynamicsResult:
     data_path: Path
     metadata_path: Path
     epochs: NDArray[np.int64]
-    representative_epochs: tuple[int, ...]
 
 
 def analyze_checkpoints(
@@ -131,11 +219,21 @@ def analyze_checkpoints(
     config: AnalysisConfig,
     output_dir: Path,
 ) -> LatentDynamicsResult:
-    """Evaluate checkpoints in a sequentially aligned exact latent basis."""
+    """Evaluate exact 2-D fields or trajectory-neighborhood K-D dynamics."""
     if len(config.input_condition) != model_config.input_size:
         raise AnalysisConfigError("input_condition length must match model input_size")
     if not checkpoint_paths:
         raise ValueError("checkpoint_paths must not be empty")
+    if model_config.rank >= 3:
+        from .high_dimensional_dynamics import analyze_high_dimensional_checkpoints
+
+        return analyze_high_dimensional_checkpoints(
+            checkpoint_paths=checkpoint_paths,
+            model_config=model_config,
+            task=task,
+            config=config,
+            output_dir=output_dir,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluation_batch = _evaluation_batch(task, config.evaluation_trials)
@@ -171,6 +269,9 @@ def analyze_checkpoints(
     bounds_source = (
         "explicit" if config.coordinate_bounds is not None else "trajectory"
     )
+    if config.square_coordinate_bounds:
+        bounds = _square_bounds(bounds)
+        bounds_source += "+square"
     expansions = 0
     for _ in range(config.max_bounds_expansions + 1):
         grid = _evaluate_latent_grid(
@@ -187,6 +288,8 @@ def analyze_checkpoints(
         if not touched or expansions >= config.max_bounds_expansions:
             break
         bounds = _expand_bounds(bounds, touched, config.bounds_expansion_fraction)
+        if config.square_coordinate_bounds:
+            bounds = _square_bounds(bounds)
         expansions += 1
     flows = grid["flows"]
     speeds = grid["speeds"]
@@ -210,16 +313,8 @@ def analyze_checkpoints(
         for model, basis, minimum_mask in zip(models, bases, speed_minima)
     ]
     minimum_data = _combine_classified_minima(classified_minima)
-    if bounds_source == "trajectory" and expansions:
-        bounds_source = f"trajectory+edge_minima_expansion({expansions})"
-
-    available_epochs = set(int(epoch) for epoch in epochs)
-    representative = tuple(
-        epoch for epoch in config.representative_epochs if epoch in available_epochs
-    )
-    final_epoch = int(epochs[-1])
-    if final_epoch not in representative:
-        representative = (*representative, final_epoch)
+    if expansions:
+        bounds_source += f"+edge_minima_expansion({expansions})"
 
     data_path = output_dir / "latent_dynamics.npz"
     np.savez_compressed(
@@ -241,6 +336,7 @@ def analyze_checkpoints(
         valid_mask=evaluation_batch.valid_mask,
         inputs=evaluation_batch.inputs,
         bounds=np.asarray(bounds),
+        square_coordinate_bounds=np.asarray(config.square_coordinate_bounds),
         input_condition=np.asarray(config.input_condition),
         task_name=np.asarray(task.config.name),
         trial_interval=np.asarray([item.interval for item in evaluation_batch.metadata]),
@@ -260,7 +356,6 @@ def analyze_checkpoints(
         {
             "name": config.name,
             "epochs": epochs.tolist(),
-            "representative_epochs": list(representative),
             "checkpoint_paths": {
                 int(epoch): str(checkpoint_paths[int(epoch)]) for epoch in epochs
             },
@@ -284,12 +379,16 @@ def analyze_checkpoints(
                 "bifurcation classification"
             ),
             "input_condition": list(config.input_condition),
+            "trajectory_initial_state": "zero",
+            "trajectory_neural_noise": "none",
+            "vector_field_noise_semantics": "deterministic drift; no sampled noise",
             "coordinate_basis": (
                 "right-singular row-space basis of W, sequentially aligned by "
                 "orthogonal Procrustes"
             ),
             "coordinate_bounds": list(bounds),
             "coordinate_bounds_source": bounds_source,
+            "square_coordinate_bounds": config.square_coordinate_bounds,
             "grid_points": config.grid_points,
             "speed_floor": config.speed_floor,
             "speed_minimum_definition": (
@@ -329,7 +428,6 @@ def analyze_checkpoints(
         data_path=data_path,
         metadata_path=metadata_path,
         epochs=epochs,
-        representative_epochs=representative,
     )
 
 
@@ -414,6 +512,23 @@ def _trajectory_bounds(
         float(center[0] + half_span[0]),
         float(center[1] - half_span[1]),
         float(center[1] + half_span[1]),
+    )
+
+
+def _square_bounds(
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Expand the shorter coordinate span around its center to form a square."""
+    x_min, x_max, y_min, y_max = bounds
+    span = max(x_max - x_min, y_max - y_min)
+    x_center = 0.5 * (x_min + x_max)
+    y_center = 0.5 * (y_min + y_max)
+    half_span = 0.5 * span
+    return (
+        x_center - half_span,
+        x_center + half_span,
+        y_center - half_span,
+        y_center + half_span,
     )
 
 

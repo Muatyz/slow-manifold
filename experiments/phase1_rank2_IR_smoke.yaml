@@ -14,7 +14,6 @@ components:
 
 overrides:
   model:
-    input_size: 1
     tau: 10.0
     dt: 1.0
   train:
@@ -25,14 +24,23 @@ overrides:
     log_every: 1
     checkpoint:
       every: 1
+    loss:
+      phase_weights:
+        - {phase: pre_go, lambda: 1.0}
+        - {phase: reproduction_wait, lambda: 1.0}
+        - {phase: response, lambda: 1.0}
   analysis:
-    input_condition: [0.0]
-    representative_epochs: [0, 1, 2]
+    representative_selection:
+      mode: manual
+      manual_epochs: [0, 1, 2]
     evaluation_trials:
       - {interval: 30.0, delay: 55.0, s1_onset: 50.0}
-      - {interval: 65.0, delay: 55.0, s1_onset: 50.0}
+      - {interval: 50.0, delay: 55.0, s1_onset: 50.0}
+      - {interval: 75.0, delay: 55.0, s1_onset: 50.0}
       - {interval: 99.0, delay: 55.0, s1_onset: 50.0}
     grid_points: 11
   visualization:
-    vector_field_dpi: 60
+    snapshot_dpi: 180
+    movie_dpi: 90
+    render_movies: true
     movie_fps: 2

@@ -1,6 +1,12 @@
 """Behavioral tasks used by slow-manifold experiments."""
 
-from ._shared import TaskBatch, TaskConfigError, Trial, TrialMetadata
+from ._shared import (
+    PhaseNormalizedLossConfig,
+    TaskBatch,
+    TaskConfigError,
+    Trial,
+    TrialMetadata,
+)
 from .factory import ConfiguredTask, create_task
 from .interval_categorization import (
     IntervalCategorizationConfig,
@@ -18,6 +24,7 @@ __all__ = [
     "IntervalCategorizationTask",
     "IntervalReproductionConfig",
     "IntervalReproductionTask",
+    "PhaseNormalizedLossConfig",
     "ReproductionSplitConfig",
     "TaskBatch",
     "TaskConfigError",

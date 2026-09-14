@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 
 from slow_manifold.config import resolve_experiment
-from slow_manifold.tasks import IntervalReproductionConfig, IntervalReproductionTask
+from slow_manifold.tasks import (
+    IntervalReproductionConfig,
+    IntervalReproductionTask,
+    PhaseNormalizedLossConfig,
+)
 from slow_manifold.tasks.interval_reproduction import TaskConfigError
 
 ROOT = Path(__file__).parents[1]
@@ -13,12 +17,15 @@ ROOT = Path(__file__).parents[1]
 
 def make_task(split: str = "train") -> IntervalReproductionTask:
     experiment = resolve_experiment(
-        ROOT / "experiments" / "phase0_reproduction_task_sanity.yaml"
+        ROOT / "experiments" / "phase1_rank2_IR.yaml"
     )
     config = IntervalReproductionConfig.from_mapping(
         experiment.components["task"], dt=experiment.components["model"]["dt"]
     )
-    return IntervalReproductionTask(config, split=split)
+    loss = PhaseNormalizedLossConfig.from_mapping(
+        experiment.components["train"]["loss"]
+    )
+    return IntervalReproductionTask(config, split=split, loss=loss)
 
 
 def test_paper_timing_and_shared_square_cues_are_encoded_exactly() -> None:

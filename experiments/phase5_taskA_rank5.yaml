@@ -1,7 +1,8 @@
-name: phase1_rank2_baseline
+name: phase5_taskA_rank_cohort
 seed: 20260903
 identity:
   label_fields:
+    rank: model.rank
     lr: train.optimizer.learning_rate
 
 components:
@@ -13,8 +14,14 @@ components:
   reporting: ../configs/reporting/training_startup.yaml
 
 overrides:
+  model:
+    rank: 5
   train:
-    optimizer:
-      learning_rate: 1e-4
     epochs: 400000
     batch_size: 64
+    optimizer:
+      learning_rate: 1.0e-4
+    # Keep the full behavioral trace while limiting post-training K-D analysis
+    # to 401 periodic states (plus any explicitly requested endpoints).
+    checkpoint:
+      every: 1000

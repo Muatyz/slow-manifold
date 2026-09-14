@@ -18,8 +18,10 @@ def test_startup_summary_reads_resolved_component_values() -> None:
     assert lines == (
         "Task: Interval Categorization | threshold=5 | waveform=square",
         "Model: Vanilla RNN | N=64 | rank=2 | activation=tanh",
-        "Train: optimizer=adam | learning rate=1e-4 | batch size=64 | "
-        "updates=200000 | device=cuda",
+        "Train: loss=phase_normalized_mse | lambda pre-response=1 | lambda response=1 | "
+        "optimizer=adam | learning rate=1e-4 | batch size=64 | "
+        "updates=400000 | validation every=10 | device=cuda | "
+        "initial state std=0.1 | neural noise std=0.001",
     )
 
 

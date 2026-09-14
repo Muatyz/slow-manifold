@@ -21,4 +21,6 @@ overrides:
     checkpoint:
       every: 1
   analysis:
-    representative_epochs: [0, 1, 2]
+    representative_selection:
+      mode: manual
+      manual_epochs: [0, 1, 2]

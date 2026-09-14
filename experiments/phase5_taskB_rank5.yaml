@@ -1,7 +1,8 @@
-name: phase1_rank2_IR
+name: phase5_taskB_rank_cohort
 seed: 20260903
 identity:
   label_fields:
+    rank: model.rank
     lr: train.optimizer.learning_rate
 
 components:
@@ -13,18 +14,23 @@ components:
   reporting: ../configs/reporting/reproduction_startup.yaml
 
 overrides:
+  model:
+    rank: 5
+    tau: 10.0
+    dt: 1.0
   train:
     epochs: 400000
     optimizer:
-      learning_rate: 1e-4
+      learning_rate: 1.0e-4
     loss:
       phase_weights:
         - {phase: pre_go, lambda: 1.0}
         - {phase: reproduction_wait, lambda: 1.0}
         - {phase: response, lambda: 1.0}
-  model:
-    tau: 10.0
-    dt: 1.0
+    # Task B trajectories are long; 1000-update spacing bounds the final
+    # trajectory-neighborhood diagnostic while preserving metrics every update.
+    checkpoint:
+      every: 1000
   analysis:
     evaluation_trials:
       - {interval: 30.0, delay: 55.0, s1_onset: 50.0}

@@ -46,6 +46,15 @@ def test_train_rejects_removed_tag_argument() -> None:
     assert error.value.code == 2
 
 
+def test_train_resume_argument_is_parsed() -> None:
+    args = build_parser().parse_args(
+        ["train", "--resume", "runs/interrupted/seed-17"]
+    )
+
+    assert args.resume == Path("runs/interrupted/seed-17")
+    assert args.experiment is None
+
+
 def test_visualize_run_argument_is_parsed() -> None:
     args = build_parser().parse_args(
         [
@@ -54,9 +63,54 @@ def test_visualize_run_argument_is_parsed() -> None:
             "runs/phase1_rank2_baseline/seed-20260903",
             "--arrow-stride",
             "1",
+            "--arrow-length-fraction",
+            "0.0075",
+            "--arrow-width",
+            "0.0012",
+            "--trajectory-line-width",
+            "0.8",
+            "--snapshot-dpi",
+            "300",
+            "--movie-dpi",
+            "120",
+            "--no-render-movies",
+            "--config-source",
+            "last",
         ]
     )
 
     assert args.run == Path("runs/phase1_rank2_baseline/seed-20260903")
     assert args.arrow_stride == 1
+    assert args.arrow_length_fraction == pytest.approx(0.0075)
+    assert args.arrow_width == pytest.approx(0.0012)
+    assert args.trajectory_line_width == pytest.approx(0.8)
+    assert args.snapshot_dpi == 300
+    assert args.movie_dpi == 120
+    assert args.render_movies is False
     assert args.coordinate_bounds is None
+    assert args.square_coordinate_bounds is None
+    assert args.config_source == "last"
+    assert args.experiment is None
+
+
+def test_visualize_current_experiment_argument_is_parsed() -> None:
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--run",
+            "runs/example",
+            "--experiment",
+            "experiments/phase1_rank2_baseline.yaml",
+        ]
+    )
+
+    assert args.config_source == "current"
+    assert args.experiment == Path("experiments/phase1_rank2_baseline.yaml")
+
+
+def test_visualize_square_coordinate_override_is_parsed() -> None:
+    args = build_parser().parse_args(
+        ["visualize", "--run", "runs/example", "--no-square-coordinate-bounds"]
+    )
+
+    assert args.square_coordinate_bounds is False

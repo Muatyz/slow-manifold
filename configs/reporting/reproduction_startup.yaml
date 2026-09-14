@@ -5,7 +5,6 @@ sections:
     title: Interval Reproduction
     fields:
       - {label: waveform, path: task.stimulus.waveform}
-      - {label: loss, path: task.loss.name}
       - {label: response threshold, path: task.evaluation.response_threshold}
   - label: Model
     title: Vanilla RNN
@@ -15,8 +14,15 @@ sections:
       - {label: activation, path: model.activation}
   - label: Train
     fields:
+      - {label: loss, path: train.loss.name}
+      - {label: lambda pre-Go, path: train.loss.phase_weights.0.lambda}
+      - {label: lambda wait, path: train.loss.phase_weights.1.lambda}
+      - {label: lambda response, path: train.loss.phase_weights.2.lambda}
       - {label: optimizer, path: train.optimizer.name}
       - {label: learning rate, path: train.optimizer.learning_rate}
       - {label: batch size, path: train.batch_size}
       - {label: updates, path: train.epochs}
+      - {label: validation every, path: train.validation_every}
       - {label: device, path: train.device}
+      - {label: initial state std, path: train.rollout.initial_state.std}
+      - {label: neural noise std, path: train.rollout.neural_noise.std}
