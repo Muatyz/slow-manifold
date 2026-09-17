@@ -19,6 +19,7 @@ from .checkpoint_selection import RepresentativeSelectionConfig
 from .speed_minima import (
     ClassifiedSpeedMinima,
     SpeedMinimumClassificationConfig,
+    TrajectorySlowPointSearchConfig,
     refine_and_classify_speed_minima,
 )
 
@@ -120,6 +121,7 @@ class AnalysisConfig:
     trajectory_count: int
     trajectory_seed: int
     neighborhood_sampling: NeighborhoodSamplingConfig
+    trajectory_slow_point_search: TrajectorySlowPointSearchConfig
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "AnalysisConfig":
@@ -176,6 +178,11 @@ class AnalysisConfig:
                 neighborhood_sampling=NeighborhoodSamplingConfig.from_mapping(
                     data.get("neighborhood_sampling")
                 ),
+                trajectory_slow_point_search=(
+                    TrajectorySlowPointSearchConfig.from_mapping(
+                        data.get("trajectory_slow_point_search")
+                    )
+                ),
             )
         except (KeyError, TypeError) as error:
             raise AnalysisConfigError(f"Invalid analysis configuration: {error}") from error
@@ -218,6 +225,7 @@ def analyze_checkpoints(
     task: ConfiguredTask,
     config: AnalysisConfig,
     output_dir: Path,
+    representative_epochs: Sequence[int] | None = None,
 ) -> LatentDynamicsResult:
     """Evaluate exact 2-D fields or trajectory-neighborhood K-D dynamics."""
     if len(config.input_condition) != model_config.input_size:
@@ -233,6 +241,7 @@ def analyze_checkpoints(
             task=task,
             config=config,
             output_dir=output_dir,
+            representative_epochs=representative_epochs,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -166,6 +166,25 @@ class Rank2CTRNN(nn.Module):
         )
         return (recurrent_term - identity) / self.config.tau
 
+    def full_state_jacobian(self, state: Tensor, inputs: Tensor) -> Tensor:
+        """Analytic continuous-time Jacobian of :meth:`flow`.
+
+        The returned matrix follows ``J[..., i, j] = dF_i / dx_j``.  This
+        full neural-state Jacobian is the one used by trajectory-seeded slow
+        point diagnostics; display projections never enter its definition.
+        """
+        drive = (
+            self.latent(state) @ self.m.T
+            + inputs @ self.input_weight.T
+            + self.bias
+        )
+        activation_slope = 1.0 - torch.tanh(drive).square()
+        recurrent_term = activation_slope.unsqueeze(-1) * self.recurrent_matrix
+        identity = torch.eye(
+            self.config.state_size, dtype=state.dtype, device=state.device
+        )
+        return (recurrent_term - identity) / self.config.tau
+
     def row_space_flow(
         self, coordinates: Tensor, inputs: Tensor, basis: Tensor
     ) -> Tensor:

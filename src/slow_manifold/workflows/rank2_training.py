@@ -387,6 +387,7 @@ def _run_experiment_pipeline(
         task=validation_task,
         config=analysis_config,
         output_dir=run_dir / "diagnostics",
+        representative_epochs=selection_result.epochs,
     )
     checkpoint_epochs = list(training_result.checkpoint_paths)
     resolved_analysis_fingerprint = analysis_fingerprint(
@@ -394,6 +395,7 @@ def _run_experiment_pipeline(
         model=experiment.components["model"],
         analysis=experiment.components["analysis"],
         checkpoint_epochs=checkpoint_epochs,
+        slow_point_epochs=selection_result.epochs,
     )
     write_analysis_stage_config(
         run_dir / "diagnostics" / "config.yaml",
@@ -402,6 +404,7 @@ def _run_experiment_pipeline(
         checkpoint_epochs=checkpoint_epochs,
         config_source="training",
         source_experiment=experiment.source,
+        slow_point_epochs=selection_result.epochs,
     )
     analysis_logger.info(
         "latent analysis complete checkpoints=%d elapsed_seconds=%.2fs",
@@ -549,6 +552,34 @@ def _run_experiment_pipeline(
         ),
         max_trajectories=int(
             visualization_config.get("max_3d_trajectories", 64)
+        ),
+        trajectory_3d_alpha=float(
+            visualization_config.get("trajectory_3d_alpha", 0.62)
+        ),
+        trajectory_3d_cue_alpha_scale=float(
+            visualization_config.get("trajectory_3d_cue_alpha_scale", 0.55)
+        ),
+        trajectory_3d_cue_line_width_scale=float(
+            visualization_config.get(
+                "trajectory_3d_cue_line_width_scale", 0.8
+            )
+        ),
+        trajectory_3d_view_elevation=float(
+            visualization_config.get("trajectory_3d_view_elevation", 26.0)
+        ),
+        trajectory_3d_view_azimuth=float(
+            visualization_config.get("trajectory_3d_view_azimuth", -68.0)
+        ),
+        single_trajectory_enabled=visualization_config.get(
+            "single_trajectory_enabled", True
+        ),
+        single_trajectory_figure_size=visualization_config.get(
+            "single_trajectory_figure_size", [7.0, 6.0]
+        ),
+        single_trajectory_interval_quantile=float(
+            visualization_config.get(
+                "single_trajectory_interval_quantile", 0.5
+            )
         ),
     )
     visualization_logger.info(

@@ -194,6 +194,29 @@ def test_selection_rules_do_not_change_latent_analysis_fingerprint() -> None:
     assert first == second
 
 
+def test_high_rank_slow_point_epochs_change_analysis_fingerprint() -> None:
+    common = {
+        "name": "analysis",
+        "trajectory_slow_point_search": {"enabled": True, "seed_count": 32},
+    }
+    first = analysis_fingerprint(
+        task={"name": "task"},
+        model={"name": "model", "rank": 3},
+        analysis=common,
+        checkpoint_epochs=[0, 100],
+        slow_point_epochs=[0],
+    )
+    second = analysis_fingerprint(
+        task={"name": "task"},
+        model={"name": "model", "rank": 3},
+        analysis=common,
+        checkpoint_epochs=[0, 100],
+        slow_point_epochs=[100],
+    )
+
+    assert first != second
+
+
 def test_old_stage_fingerprint_is_canonicalized_without_fixed_epochs(
     tmp_path: Path,
 ) -> None:

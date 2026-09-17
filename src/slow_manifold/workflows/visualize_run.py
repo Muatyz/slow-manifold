@@ -173,11 +173,28 @@ def rerun_rank2_visualization(
         if checkpoint_paths
         else _stored_diagnostic_epochs(data_path)
     )
+    selection_result = select_representative_checkpoints(
+        metrics_path=metrics_path,
+        checkpoint_epochs=checkpoint_epochs,
+        config=analysis_config.representative_selection,
+        output_path=diagnostics_dir / "checkpoint_selection.yaml",
+        source=(
+            "visualize:cli-manual"
+            if representative_epochs is not None
+            else (
+                f"visualize:{config_source}:"
+                f"{analysis_config.representative_selection.mode}"
+            )
+        ),
+    )
+    representatives = list(selection_result.epochs)
+    representative_labels = selection_result.labels
     desired_analysis_fingerprint = analysis_fingerprint(
         task=task_mapping,
         model=model_mapping,
         analysis=analysis_mapping,
         checkpoint_epochs=checkpoint_epochs,
+        slow_point_epochs=representatives,
     )
     stage_config_path = diagnostics_dir / "config.yaml"
     stored_analysis_fingerprint = _stored_latent_analysis_fingerprint(
@@ -191,6 +208,7 @@ def rerun_rank2_visualization(
             model=model_mapping,
             analysis=components["analysis"],
             checkpoint_epochs=checkpoint_epochs,
+            slow_point_epochs=representatives,
         )
         fingerprint_changed = (
             desired_analysis_fingerprint != original_analysis_fingerprint
@@ -233,6 +251,7 @@ def rerun_rank2_visualization(
             task=validation_task,
             config=analysis_config,
             output_dir=diagnostics_dir,
+            representative_epochs=representatives,
         )
         logger.info(
             "latent dynamics recomputed checkpoints=%d bounds=%s grid_points=%d",
@@ -240,19 +259,6 @@ def rerun_rank2_visualization(
             _format_bounds(result),
             analysis_config.grid_points,
         )
-    selection_result = select_representative_checkpoints(
-        metrics_path=metrics_path,
-        checkpoint_epochs=checkpoint_epochs,
-        config=analysis_config.representative_selection,
-        output_path=diagnostics_dir / "checkpoint_selection.yaml",
-        source=(
-            "visualize:cli-manual"
-            if representative_epochs is not None
-            else f"visualize:{config_source}:{analysis_config.representative_selection.mode}"
-        ),
-    )
-    representatives = list(selection_result.epochs)
-    representative_labels = selection_result.labels
     logger.info(
         "representative checkpoints selected mode=%s transition=%s "
         "terminal_regime=%s epochs=%s",
@@ -268,6 +274,7 @@ def rerun_rank2_visualization(
         checkpoint_epochs=checkpoint_epochs,
         config_source=config_source,
         source_experiment=analysis_source_experiment,
+        slow_point_epochs=representatives,
         cli_overrides=analysis_overrides,
     )
 
@@ -417,6 +424,34 @@ def rerun_rank2_visualization(
         max_trajectories=int(
             visualization_mapping.get("max_3d_trajectories", 64)
         ),
+        trajectory_3d_alpha=float(
+            visualization_mapping.get("trajectory_3d_alpha", 0.62)
+        ),
+        trajectory_3d_cue_alpha_scale=float(
+            visualization_mapping.get("trajectory_3d_cue_alpha_scale", 0.55)
+        ),
+        trajectory_3d_cue_line_width_scale=float(
+            visualization_mapping.get(
+                "trajectory_3d_cue_line_width_scale", 0.8
+            )
+        ),
+        trajectory_3d_view_elevation=float(
+            visualization_mapping.get("trajectory_3d_view_elevation", 26.0)
+        ),
+        trajectory_3d_view_azimuth=float(
+            visualization_mapping.get("trajectory_3d_view_azimuth", -68.0)
+        ),
+        single_trajectory_enabled=visualization_mapping.get(
+            "single_trajectory_enabled", True
+        ),
+        single_trajectory_figure_size=visualization_mapping.get(
+            "single_trajectory_figure_size", [7.0, 6.0]
+        ),
+        single_trajectory_interval_quantile=float(
+            visualization_mapping.get(
+                "single_trajectory_interval_quantile", 0.5
+            )
+        ),
     )
     logger.info(
         "combined latent dynamics artifacts written snapshots=%d "
@@ -474,6 +509,8 @@ def _diagnostics_require_recompute(data_path: Path, rank: int = 2) -> bool:
             return not {
                 "coordinate_dimension",
                 "coordinate_kind",
+                "display_bounds_by_epoch",
+                "slow_point_search_enabled",
                 "trajectory_latent",
                 "neighborhood_latent",
                 "neighborhood_q",
@@ -481,6 +518,12 @@ def _diagnostics_require_recompute(data_path: Path, rank: int = 2) -> bool:
                 "neighborhood_spectral_abscissa",
                 "neighborhood_low_q_mask",
                 "neighborhood_near_zero_mask",
+                "slow_point_epoch_index",
+                "slow_point_coordinates",
+                "slow_point_q",
+                "slow_point_jacobian_eigenvalues",
+                "slow_point_spectral_abscissa",
+                "slow_point_accepted",
             }.issubset(data.files)
         return not {
             "jacobian_eigenvalues",
@@ -590,6 +633,9 @@ def _stored_latent_analysis_fingerprint(
         model=model,
         analysis=config,
         checkpoint_epochs=[int(epoch) for epoch in checkpoint_epochs],
+        slow_point_epochs=[
+            int(epoch) for epoch in record.get("slow_point_epochs", ())
+        ],
     )
 
 

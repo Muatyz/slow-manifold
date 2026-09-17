@@ -15,7 +15,7 @@ from matplotlib import pyplot as plt  # noqa: E402
 from matplotlib import patheffects  # noqa: E402
 from matplotlib.animation import FFMpegWriter  # noqa: E402
 from matplotlib.cm import ScalarMappable  # noqa: E402
-from matplotlib.colors import Normalize, to_rgba  # noqa: E402
+from matplotlib.colors import LogNorm, Normalize, to_rgba  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
@@ -30,6 +30,7 @@ _TRAJECTORY_SHORT_COLOR = "#0072B2"
 _TRAJECTORY_LONG_COLOR = "#E69F00"
 _REPRODUCTION_TRAJECTORY_CMAP = "plasma"
 _CUE_TRAJECTORY_COLOR = "#F0E442"
+_REPRODUCTION_CUE_TRAJECTORY_COLOR = "tab:red"
 _DEFAULT_TRAJECTORY_LINE_WIDTH = 1.5
 # Default decision-band half-width in readout-logit units (Dinc convention:
 # the band spans logits (-1, 1), i.e. sigma(-1)..sigma(1) for a sigmoid
@@ -95,25 +96,40 @@ def _trajectory_class_color(class_value: int) -> str:
     )
 
 
-def _trajectory_path_effects(line_width: float):
+def _trajectory_path_effects(line_width: float, *, alpha: float = 0.9):
     if line_width <= 0:
         raise ValueError("trajectory_line_width must be positive")
     return (
         patheffects.Stroke(
             linewidth=2.1 * line_width,
             foreground="white",
-            alpha=0.9,
+            alpha=alpha,
         ),
         patheffects.Normal(),
     )
 
 
-def _cue_line_width(trajectory_line_width: float) -> float:
-    return 1.45 * trajectory_line_width
+def _cue_trajectory_color(data: Mapping[str, np.ndarray]) -> str:
+    return (
+        _REPRODUCTION_CUE_TRAJECTORY_COLOR
+        if _is_reproduction(data)
+        else _CUE_TRAJECTORY_COLOR
+    )
 
 
-def _cue_path_effects(trajectory_line_width: float):
-    cue_width = _cue_line_width(trajectory_line_width)
+def _cue_line_width(
+    data: Mapping[str, np.ndarray], trajectory_line_width: float
+) -> float:
+    scale = 1.15 if _is_reproduction(data) else 1.45
+    return scale * trajectory_line_width
+
+
+def _cue_path_effects(
+    data: Mapping[str, np.ndarray], trajectory_line_width: float
+):
+    if _is_reproduction(data):
+        return ()
+    cue_width = _cue_line_width(data, trajectory_line_width)
     return (
         patheffects.Stroke(
             linewidth=1.75 * cue_width,
@@ -768,6 +784,14 @@ def render_latent_dynamics_collection(
     response_threshold: float = 0.5,
     spectral_abscissa_limit: float | None = None,
     max_trajectories: int = 64,
+    trajectory_3d_alpha: float = 0.62,
+    trajectory_3d_cue_alpha_scale: float = 0.55,
+    trajectory_3d_cue_line_width_scale: float = 0.8,
+    trajectory_3d_view_elevation: float = 26.0,
+    trajectory_3d_view_azimuth: float = -68.0,
+    single_trajectory_enabled: bool = True,
+    single_trajectory_figure_size: Sequence[float] = (7.0, 6.0),
+    single_trajectory_interval_quantile: float = 0.5,
 ) -> dict[str, Path | list[Path] | None]:
     """Render synchronized vector-field/Jacobian panels and their MP4."""
     with np.load(diagnostics_path) as stored:
@@ -789,6 +813,16 @@ def render_latent_dynamics_collection(
             trajectory_line_width=trajectory_line_width,
             max_trajectories=max_trajectories,
             spectral_abscissa_limit=spectral_abscissa_limit,
+            trajectory_alpha=trajectory_3d_alpha,
+            cue_alpha_scale=trajectory_3d_cue_alpha_scale,
+            cue_line_width_scale=trajectory_3d_cue_line_width_scale,
+            view_elevation=trajectory_3d_view_elevation,
+            view_azimuth=trajectory_3d_view_azimuth,
+            single_trajectory_enabled=single_trajectory_enabled,
+            single_trajectory_figure_size=single_trajectory_figure_size,
+            single_trajectory_interval_quantile=(
+                single_trajectory_interval_quantile
+            ),
         )
     data = _load_vector_field_data(diagnostics_path)
     available = {int(epoch) for epoch in data["epochs"]}
@@ -866,10 +900,28 @@ def render_high_dimensional_dynamics_collection(
     trajectory_line_width: float = _DEFAULT_TRAJECTORY_LINE_WIDTH,
     max_trajectories: int = 64,
     spectral_abscissa_limit: float | None = None,
+    trajectory_alpha: float = 0.62,
+    cue_alpha_scale: float = 0.55,
+    cue_line_width_scale: float = 0.8,
+    view_elevation: float = 26.0,
+    view_azimuth: float = -68.0,
+    single_trajectory_enabled: bool = True,
+    single_trajectory_figure_size: Sequence[float] = (7.0, 6.0),
+    single_trajectory_interval_quantile: float = 0.5,
 ) -> dict[str, Path | list[Path] | None]:
-    """Render 3-D trajectories, sampled low-q regions, and near-zero spectra."""
+    """Render 3-D trajectories and trajectory-seeded full-state slow points."""
     if max_trajectories <= 0:
         raise ValueError("max_trajectories must be positive")
+    if not isinstance(single_trajectory_enabled, bool):
+        raise ValueError("single_trajectory_enabled must be a boolean")
+    if not 0 < trajectory_alpha <= 1:
+        raise ValueError("trajectory_3d_alpha must lie in (0, 1]")
+    if not 0 <= cue_alpha_scale <= 1 or cue_line_width_scale <= 0:
+        raise ValueError(
+            "trajectory cue alpha scale must lie in [0, 1] and width scale positive"
+        )
+    if not 0 <= single_trajectory_interval_quantile <= 1:
+        raise ValueError("single_trajectory_interval_quantile must lie in [0, 1]")
     data = _load_vector_field_data(diagnostics_path)
     if int(data["coordinate_dimension"]) != 3:
         raise ValueError("high-dimensional display diagnostics must be 3-D")
@@ -879,11 +931,26 @@ def render_high_dimensional_dynamics_collection(
     snapshot_epochs = [
         int(epoch) for epoch in representative_epochs if int(epoch) in available
     ]
-    q_values = np.log10(np.maximum(data["neighborhood_q"], np.finfo(float).tiny))
-    q_norm = Normalize(vmin=float(q_values.min()), vmax=float(q_values.max()))
-    spectral_norm = _spectral_abscissa_norm(
-        data["neighborhood_spectral_abscissa"], spectral_abscissa_limit
-    )
+    refined = bool(data.get("slow_point_search_enabled", np.asarray(False)))
+    if refined:
+        snapshot_indices = np.asarray(
+            [_epoch_index(data["epochs"], epoch) for epoch in snapshot_epochs]
+        )
+        selected = data["slow_point_accepted"] & np.isin(
+            data["slow_point_epoch_index"], snapshot_indices
+        )
+        q_values = data["slow_point_q"]
+        q_norm = _robust_positive_log_norm(q_values[selected])
+        spectral_norm = _spectral_abscissa_norm(
+            data["slow_point_spectral_abscissa"][selected],
+            spectral_abscissa_limit,
+        )
+    else:
+        q_values = np.maximum(data["neighborhood_q"], np.finfo(float).tiny)
+        q_norm = _robust_positive_log_norm(q_values)
+        spectral_norm = _spectral_abscissa_norm(
+            data["neighborhood_spectral_abscissa"], spectral_abscissa_limit
+        )
 
     snapshots: list[Path] = []
     for epoch in snapshot_epochs:
@@ -900,6 +967,12 @@ def render_high_dimensional_dynamics_collection(
             spectral_norm=spectral_norm,
             trajectory_line_width=trajectory_line_width,
             max_trajectories=max_trajectories,
+            refined_slow_points=refined,
+            trajectory_alpha=trajectory_alpha,
+            cue_alpha_scale=cue_alpha_scale,
+            cue_line_width_scale=cue_line_width_scale,
+            view_elevation=view_elevation,
+            view_azimuth=view_azimuth,
         )
         path = destination / f"epoch-{epoch:06d}.png"
         figure.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -941,10 +1014,43 @@ def render_high_dimensional_dynamics_collection(
                     spectral_norm=spectral_norm,
                     trajectory_line_width=trajectory_line_width,
                     max_trajectories=max_trajectories,
+                    refined_slow_points=refined,
+                    trajectory_alpha=trajectory_alpha,
+                    cue_alpha_scale=cue_alpha_scale,
+                    cue_line_width_scale=cue_line_width_scale,
+                    view_elevation=view_elevation,
+                    view_azimuth=view_azimuth,
                 )
                 writer.grab_frame()
         plt.close(figure)
-    return {"snapshots": snapshots, "movie": movie_path}
+    single_trajectory_path = None
+    if single_trajectory_enabled and snapshot_epochs:
+        epoch = snapshot_epochs[-1]
+        frame_index = _epoch_index(data["epochs"], epoch)
+        single_trajectory_path = _plot_single_trajectory_schematic(
+            data=data,
+            output_path=(
+                destination
+                / "single_trajectory"
+                / f"epoch-{epoch:06d}.png"
+            ),
+            frame_index=frame_index,
+            epoch=epoch,
+            representative_label=(representative_labels or {}).get(epoch),
+            figure_size=single_trajectory_figure_size,
+            dpi=dpi,
+            line_width=1.35 * trajectory_line_width,
+            interval_quantile=single_trajectory_interval_quantile,
+            cue_alpha_scale=cue_alpha_scale,
+            cue_line_width_scale=cue_line_width_scale,
+            view_elevation=view_elevation,
+            view_azimuth=view_azimuth,
+        )
+    return {
+        "snapshots": snapshots,
+        "movie": movie_path,
+        "single_trajectory": single_trajectory_path,
+    }
 
 
 def _high_dimensional_figure(figure_size: Sequence[float]):
@@ -963,6 +1069,12 @@ def _draw_high_dimensional_frame(
     spectral_norm: Normalize,
     trajectory_line_width: float,
     max_trajectories: int,
+    refined_slow_points: bool,
+    trajectory_alpha: float,
+    cue_alpha_scale: float,
+    cue_line_width_scale: float,
+    view_elevation: float,
+    view_azimuth: float,
 ) -> None:
     axes = [figure.add_subplot(1, 3, index, projection="3d") for index in (1, 2, 3)]
     title_suffix = (
@@ -977,8 +1089,11 @@ def _draw_high_dimensional_frame(
         frame_index=frame_index,
         selected_trials=selected_trials,
         line_width=trajectory_line_width,
-        alpha=0.75,
+        alpha=trajectory_alpha,
         phase_styles=True,
+        cue_alpha_scale=cue_alpha_scale,
+        cue_line_width_scale=cue_line_width_scale,
+        halo_alpha=0.45,
     )
     axes[0].set_title(f"task trajectories\n{title_suffix}")
 
@@ -991,13 +1106,29 @@ def _draw_high_dimensional_frame(
             line_width=0.55 * trajectory_line_width,
             alpha=0.10,
             phase_styles=False,
+            cue_alpha_scale=cue_alpha_scale,
+            cue_line_width_scale=cue_line_width_scale,
+            halo_alpha=0.25,
         )
-    coordinates = data["neighborhood_coordinates"][frame_index]
-    low_q = data["neighborhood_low_q_mask"][frame_index]
-    if np.any(low_q):
+    if refined_slow_points:
+        frame_points = data["slow_point_epoch_index"] == frame_index
+        selected = frame_points & data["slow_point_accepted"]
+        coordinates = data["slow_point_coordinates"]
+        q = q_values
+        spectral = data["slow_point_spectral_abscissa"]
+        fixed = selected & data["slow_point_is_fixed"]
+        colored_q = selected & ~fixed & (q > 0)
+    else:
+        coordinates = data["neighborhood_coordinates"][frame_index]
+        selected = data["neighborhood_low_q_mask"][frame_index]
+        q = q_values[frame_index]
+        spectral = data["neighborhood_spectral_abscissa"][frame_index]
+        fixed = np.zeros_like(selected)
+        colored_q = selected
+    if np.any(colored_q):
         slow_scatter = axes[1].scatter(
-            *coordinates[low_q].T,
-            c=q_values[frame_index, low_q],
+            *coordinates[colored_q].T,
+            c=q[colored_q],
             cmap="viridis_r",
             norm=q_norm,
             s=12,
@@ -1009,19 +1140,36 @@ def _draw_high_dimensional_frame(
             ax=axes[1],
             shrink=0.58,
             pad=0.02,
-            label=r"$\log_{10}q$",
+            label=r"$q_x=\frac{1}{2}\|F_x\|^2$",
         )
-    else:
+    if np.any(fixed):
+        axes[1].scatter(
+            *coordinates[fixed].T,
+            facecolors="none",
+            edgecolors="cyan",
+            marker="D",
+            s=24,
+            linewidths=0.9,
+            depthshade=False,
+        )
+    if not np.any(selected):
         axes[1].text2D(0.3, 0.5, "no selected samples", transform=axes[1].transAxes)
-    threshold = float(data["neighborhood_low_q_threshold"][frame_index])
-    axes[1].set_title(f"sampled low-q region\nq ≤ {threshold:.2e}")
+    if refined_slow_points:
+        stationary = selected & data["slow_point_optimization_converged"]
+        axes[1].set_title(
+            "optimized low-q endpoints\n"
+            f"q-accepted {int(selected.sum())}; stationary {int(stationary.sum())}"
+        )
+        spectral_selected = selected
+    else:
+        threshold = float(data["neighborhood_low_q_threshold"][frame_index])
+        axes[1].set_title(f"legacy sampled low-q region\nq ≤ {threshold:.2e}")
+        spectral_selected = data["neighborhood_near_zero_mask"][frame_index]
 
-    near_zero = data["neighborhood_near_zero_mask"][frame_index]
-    spectral = data["neighborhood_spectral_abscissa"][frame_index]
-    if np.any(near_zero):
+    if np.any(spectral_selected):
         spectrum_scatter = axes[2].scatter(
-            *coordinates[near_zero].T,
-            c=spectral[near_zero],
+            *coordinates[spectral_selected].T,
+            c=spectral[spectral_selected],
             cmap="coolwarm",
             norm=spectral_norm,
             s=12,
@@ -1033,16 +1181,24 @@ def _draw_high_dimensional_frame(
             ax=axes[2],
             shrink=0.58,
             pad=0.02,
-            label=r"$\max_i\,\mathrm{Re}\,\lambda_i(J_\kappa)$",
+            label=r"$\max_i\,\mathrm{Re}\,\lambda_i(J_x)$",
         )
     else:
         axes[2].text2D(
             0.27, 0.5, "no near-zero samples", transform=axes[2].transAxes
         )
-    axes[2].set_title("near-zero spectral abscissa")
+    axes[2].set_title(
+        "same slow points: spectral abscissa"
+        if refined_slow_points
+        else "legacy near-zero spectral abscissa"
+    )
 
     labels = [str(value) for value in data["coordinate_labels"]]
-    bounds = data["display_bounds"]
+    bounds = (
+        data["display_bounds_by_epoch"][frame_index]
+        if "display_bounds_by_epoch" in data
+        else data["display_bounds"]
+    )
     for axis in axes:
         axis.set_xlabel(labels[0])
         axis.set_ylabel(labels[1])
@@ -1051,13 +1207,104 @@ def _draw_high_dimensional_frame(
         axis.set_ylim(*bounds[1])
         axis.set_zlim(*bounds[2])
         axis.set_box_aspect((1, 1, 1))
-        axis.view_init(elev=22, azim=-58)
+        axis.view_init(elev=view_elevation, azim=view_azimuth)
     axes[0].legend(
-        handles=_high_dimensional_legend_handles(data, trajectory_line_width),
+        handles=_high_dimensional_legend_handles(
+            data,
+            trajectory_line_width,
+            cue_line_width_scale=cue_line_width_scale,
+        ),
         loc="upper left",
         fontsize=6,
         frameon=False,
     )
+
+
+def _plot_single_trajectory_schematic(
+    *,
+    data: Mapping[str, np.ndarray],
+    output_path: Path,
+    frame_index: int,
+    epoch: int,
+    representative_label: str | None,
+    figure_size: Sequence[float],
+    dpi: int,
+    line_width: float,
+    interval_quantile: float,
+    cue_alpha_scale: float,
+    cue_line_width_scale: float,
+    view_elevation: float,
+    view_azimuth: float,
+) -> Path:
+    trial = _representative_trajectory_index(data, interval_quantile)
+    figure = plt.figure(figsize=tuple(figure_size), constrained_layout=True)
+    axis = figure.add_subplot(1, 1, 1, projection="3d")
+    _draw_3d_trajectories(
+        axis,
+        data=data,
+        frame_index=frame_index,
+        selected_trials=np.asarray([trial]),
+        line_width=line_width,
+        alpha=0.96,
+        phase_styles=True,
+        cue_alpha_scale=min(1.0, 1.25 * cue_alpha_scale),
+        cue_line_width_scale=cue_line_width_scale,
+        halo_alpha=0.8,
+    )
+    length = int(data["trajectory_valid_mask"][trial].sum())
+    points = data["trajectory"][frame_index, trial, :length]
+    bounds = _single_trajectory_bounds(points, padding_fraction=0.08)
+    labels = [str(value) for value in data["coordinate_labels"]]
+    axis.set_xlabel(labels[0])
+    axis.set_ylabel(labels[1])
+    axis.set_zlabel(labels[2])
+    axis.set_xlim(*bounds[0])
+    axis.set_ylim(*bounds[1])
+    axis.set_zlim(*bounds[2])
+    axis.set_box_aspect((1, 1, 1))
+    axis.view_init(elev=view_elevation, azim=view_azimuth)
+    interval = float(data["trajectory_trial_interval"][trial])
+    delay = float(data["trajectory_trial_delay"][trial])
+    label = f"{representative_label} — " if representative_label else ""
+    axis.set_title(
+        f"single task trajectory\n{label}epoch {epoch}; T={interval:g}, delay={delay:g}"
+    )
+    axis.legend(
+        handles=_high_dimensional_legend_handles(
+            data,
+            line_width,
+            cue_line_width_scale=cue_line_width_scale,
+        ),
+        loc="upper left",
+        fontsize=7,
+        frameon=False,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+    return output_path
+
+
+def _representative_trajectory_index(
+    data: Mapping[str, np.ndarray], interval_quantile: float
+) -> int:
+    intervals = np.asarray(data["trajectory_trial_interval"], dtype=float)
+    target = float(np.quantile(intervals, interval_quantile))
+    distances = np.abs(intervals - target)
+    return int(np.flatnonzero(distances == distances.min())[0])
+
+
+def _single_trajectory_bounds(
+    points: np.ndarray, *, padding_fraction: float
+) -> np.ndarray:
+    minima = points.min(axis=0)
+    maxima = points.max(axis=0)
+    center = 0.5 * (minima + maxima)
+    span = maxima - minima
+    minimum_span = max(float(span.max()) * 0.04, 1.0e-6)
+    half_span = 0.5 * np.maximum(span, minimum_span)
+    half_span *= 1.0 + 2.0 * padding_fraction
+    return np.column_stack((center - half_span, center + half_span))
 
 
 def _selected_trajectory_indices(
@@ -1078,6 +1325,9 @@ def _draw_3d_trajectories(
     line_width: float,
     alpha: float,
     phase_styles: bool,
+    cue_alpha_scale: float = 1.0,
+    cue_line_width_scale: float = 1.0,
+    halo_alpha: float = 0.9,
 ) -> None:
     trajectories = data["trajectory"][frame_index]
     target = data["trajectory_target"]
@@ -1109,7 +1359,9 @@ def _draw_3d_trajectories(
                     linewidth=line_width,
                     linestyle=_TRAJECTORY_PHASE_LINESTYLES[phase],
                     alpha=alpha,
-                    path_effects=_trajectory_path_effects(line_width),
+                    path_effects=_trajectory_path_effects(
+                        line_width, alpha=halo_alpha
+                    ),
                 )
         for start, stop in _cue_driven_point_ranges(
             data["trajectory_inputs"][trial, :length]
@@ -1118,10 +1370,13 @@ def _draw_3d_trajectories(
             if segment.shape[0] >= 2:
                 axis.plot(
                     *segment.T,
-                    color=_CUE_TRAJECTORY_COLOR,
-                    linewidth=_cue_line_width(line_width),
-                    alpha=alpha,
-                    path_effects=_cue_path_effects(line_width),
+                    color=_cue_trajectory_color(data),
+                    linewidth=(
+                        cue_line_width_scale
+                        * _cue_line_width(data, line_width)
+                    ),
+                    alpha=alpha * cue_alpha_scale,
+                    path_effects=_cue_path_effects(data, line_width),
                     zorder=4,
                 )
         axis.scatter(
@@ -1181,7 +1436,9 @@ def _high_dimensional_trajectory_color(
 
 
 def _high_dimensional_legend_handles(
-    data: Mapping[str, np.ndarray], line_width: float
+    data: Mapping[str, np.ndarray], line_width: float,
+    *,
+    cue_line_width_scale: float = 1.0,
 ) -> list[Line2D]:
     if _is_reproduction(data):
         condition_handles = [
@@ -1233,8 +1490,10 @@ def _high_dimensional_legend_handles(
         Line2D(
             [],
             [],
-            color=_CUE_TRAJECTORY_COLOR,
-            linewidth=_cue_line_width(line_width),
+            color=_cue_trajectory_color(data),
+            linewidth=(
+                cue_line_width_scale * _cue_line_width(data, line_width)
+            ),
             label=r"cue on ($u\ne0$)",
         )
     ]
@@ -1682,15 +1941,28 @@ def _log_speed(speed: np.ndarray, speed_floor: float) -> np.ndarray:
     return np.log10(np.maximum(speed, speed_floor))
 
 
+def _robust_positive_log_norm(values: np.ndarray) -> LogNorm:
+    finite = np.asarray(values)[
+        np.isfinite(values) & (np.asarray(values) > 0)
+    ]
+    if finite.size == 0:
+        return LogNorm(vmin=1.0e-12, vmax=1.0e-4)
+    vmin, vmax = np.quantile(finite, [0.02, 0.98])
+    vmin = max(float(vmin), np.finfo(float).tiny)
+    vmax = float(vmax)
+    if vmax <= vmin:
+        vmax = vmin * 10.0
+    return LogNorm(vmin=vmin, vmax=vmax, clip=True)
+
+
 def _spectral_abscissa_norm(
     spectral_abscissa: np.ndarray, configured_limit: float | None
 ) -> Normalize:
     if configured_limit is not None and configured_limit <= 0:
         raise ValueError("jacobian_spectral_abscissa_limit must be positive or null")
-    limit = (
-        float(configured_limit)
-        if configured_limit is not None
-        else float(np.nanmax(np.abs(spectral_abscissa)))
+    finite = np.abs(np.asarray(spectral_abscissa)[np.isfinite(spectral_abscissa)])
+    limit = float(configured_limit) if configured_limit is not None else (
+        float(np.quantile(finite, 0.98)) if finite.size else 1.0
     )
     if not np.isfinite(limit):
         raise ValueError("Jacobian spectral abscissa contains no finite values")
@@ -2013,10 +2285,10 @@ def _draw_cue_driven_segments(
         axis.plot(
             segment[:, 0],
             segment[:, 1],
-            color=_CUE_TRAJECTORY_COLOR,
-            linewidth=_cue_line_width(trajectory_line_width),
+            color=_cue_trajectory_color(data),
+            linewidth=_cue_line_width(data, trajectory_line_width),
             linestyle="-",
-            path_effects=_cue_path_effects(trajectory_line_width),
+            path_effects=_cue_path_effects(data, trajectory_line_width),
             zorder=4,
         )
 
@@ -2126,10 +2398,10 @@ def _trajectory_phase_legend_handles(
             Line2D(
                 [],
                 [],
-                color=_CUE_TRAJECTORY_COLOR,
+                color=_cue_trajectory_color(data),
                 linestyle="-",
-                linewidth=_cue_line_width(trajectory_line_width),
-                path_effects=_cue_path_effects(trajectory_line_width),
+                linewidth=_cue_line_width(data, trajectory_line_width),
+                path_effects=_cue_path_effects(data, trajectory_line_width),
                 label=r"cue on ($u\ne0$)",
             )
         )

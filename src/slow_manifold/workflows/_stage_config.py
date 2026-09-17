@@ -20,23 +20,28 @@ def analysis_fingerprint(
     model: Mapping[str, Any],
     analysis: Mapping[str, Any],
     checkpoint_epochs: Sequence[int],
+    slow_point_epochs: Sequence[int] | None = None,
 ) -> str:
     """Identify the inputs that determine structured latent diagnostics."""
     latent_analysis = deepcopy(dict(analysis))
-    # Representative checkpoint selection consumes metrics and existing
-    # checkpoints; it does not change trajectories, fields, or Jacobians.
-    # Keeping it out of this fingerprint avoids an expensive grid recompute
-    # when a user only changes the selected presentation epochs.
+    # Selection rules are presentation concerns, so they stay out of the
+    # generic analysis mapping. For rank >= 3, the concrete selected epochs
+    # are added below because they determine where full-state refinement runs.
     latent_analysis.pop("representative_selection", None)
     latent_analysis.pop("representative_epochs", None)
-    return _fingerprint(
-        {
-            "task": task,
-            "model": model,
-            "analysis": latent_analysis,
-            "checkpoint_epochs": [int(epoch) for epoch in checkpoint_epochs],
-        }
-    )
+    payload: dict[str, Any] = {
+        "task": task,
+        "model": model,
+        "analysis": latent_analysis,
+        "checkpoint_epochs": [int(epoch) for epoch in checkpoint_epochs],
+    }
+    search = latent_analysis.get("trajectory_slow_point_search", {})
+    search_enabled = not isinstance(search, Mapping) or search.get("enabled", True)
+    if int(model.get("rank", 2)) >= 3 and search_enabled:
+        payload["slow_point_epochs"] = [
+            int(epoch) for epoch in (slow_point_epochs or ())
+        ]
+    return _fingerprint(payload)
 
 
 def visualization_fingerprint(
@@ -65,6 +70,7 @@ def write_analysis_stage_config(
     checkpoint_epochs: Sequence[int],
     config_source: str,
     source_experiment: str | None,
+    slow_point_epochs: Sequence[int] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> None:
     """Write the complete resolved analysis component used successfully."""
@@ -77,6 +83,9 @@ def write_analysis_stage_config(
             "source_experiment": source_experiment,
             "fingerprint": fingerprint,
             "checkpoint_epochs": [int(epoch) for epoch in checkpoint_epochs],
+            "slow_point_epochs": [
+                int(epoch) for epoch in (slow_point_epochs or ())
+            ],
             "cli_overrides": deepcopy(dict(cli_overrides or {})),
             "config": deepcopy(dict(config)),
         },

@@ -15,6 +15,7 @@ from .latent_dynamics import (
 )
 from .speed_minima import (
     SpeedMinimumClassificationConfig,
+    TrajectorySlowPointSearchConfig,
     classify_speed_minimum,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     "RepresentativeSelectionConfig",
     "SelectedCheckpoint",
     "SpeedMinimumClassificationConfig",
+    "TrajectorySlowPointSearchConfig",
     "analyze_checkpoints",
     "classify_speed_minimum",
     "select_representative_checkpoints",

@@ -1,6 +1,6 @@
 # Low-Rank RNN Timing Dynamics：研究计划
 
-> 状态（2026-09-15）：rank-K 训练公共路径和 K≥3 的 trajectory-neighborhood diagnostics 已实现；K=3 使用 exact κ 三坐标，K>3（含 K=4）使用 task-trajectory PCA 前三轴显示。Task A/B 的 rank-3/rank-5 端到端 smoke 与 checkpoint resume 已通过；正式训练、multi-seed、连续 slow-point refinement、eigenvectors 与 full-state ghost diagnostics 尚未完成。
+> 状态（2026-09-18）：rank-K 训练公共路径和 K≥3 diagnostics 已实现；代表性 checkpoints 支持 trajectory-seeded full-state slow-point refinement 和同点 full-state Jacobian，K=3 使用 exact κ 三坐标，K>3（含 K=4）使用 task-trajectory PCA 前三轴显示。Task A/B 的 rank-3/rank-5 端到端 smoke 与 checkpoint resume 已通过；multi-seed、eigenvectors 与 full-state ghost classification 尚未完成。
 
 ## 1. 研究目标
 
@@ -185,7 +185,7 @@ categorization 的 generalization 与 interval reproduction 不完全等价，�
 仅在 low-rank cohort 的行为与静态 diagnostics 通过验收后进入：
 
 - [ ] 保持 task、训练 protocol 和主要超参数尽可能一致，只移除 rank constraint。
-- [ ] slow-point search 和 Jacobian analysis 在完整状态空间进行；PCA 只用于展示。
+- [x] slow-point search 和 Jacobian analysis 在完整状态空间进行；PCA 只用于展示。
 - [ ] 比较行为表现、训练稳定性、slow structures 与 seed-to-seed variability。
 - [ ] 判断 rank-2 中观察到的机制是普遍现象还是低秩约束的结果。
 

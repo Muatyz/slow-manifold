@@ -14,6 +14,8 @@ from slow_manifold.models import Rank2CTRNN, Rank2CTRNNConfig
 from slow_manifold.tasks import ConfiguredTask, TaskBatch
 from slow_manifold.training.checkpoint import load_checkpoint
 
+from .speed_minima import refine_full_state_slow_points
+
 if TYPE_CHECKING:
     from .latent_dynamics import (
         AnalysisConfig,
@@ -29,6 +31,7 @@ def analyze_high_dimensional_checkpoints(
     task: ConfiguredTask,
     config: AnalysisConfig,
     output_dir: Path,
+    representative_epochs: Sequence[int] | None = None,
 ) -> LatentDynamicsResult:
     """Sample exact K-D dynamics near tasks and project only for 3-D display."""
     from .latent_dynamics import LatentDynamicsResult
@@ -47,6 +50,20 @@ def analyze_high_dimensional_checkpoints(
         trajectory_batch.inputs, dtype=model_config.torch_dtype
     )
     epochs = np.asarray(sorted(checkpoint_paths), dtype=np.int64)
+    slow_point_epochs = {
+        int(epoch)
+        for epoch in (
+            epochs.tolist()
+            if representative_epochs is None
+            else representative_epochs
+        )
+        if int(epoch) in set(epochs.tolist())
+    }
+    slow_seed_indices, slow_seed_phases = _phase_stratified_seed_indices(
+        trajectory_batch,
+        seed_count=config.trajectory_slow_point_search.seed_count,
+        seed=config.trajectory_seed,
+    )
 
     models: list[Rank2CTRNN] = []
     predictions: list[np.ndarray] = []
@@ -65,6 +82,7 @@ def analyze_high_dimensional_checkpoints(
     near_zero_masks: list[np.ndarray] = []
     low_q_thresholds: list[float] = []
     sampling_radii: list[np.ndarray] = []
+    slow_point_records: list[dict[str, np.ndarray]] = []
 
     previous_components: torch.Tensor | None = None
     valid_mask_t = torch.as_tensor(trajectory_batch.valid_mask, dtype=torch.bool)
@@ -78,7 +96,8 @@ def analyze_high_dimensional_checkpoints(
         model.requires_grad_(False)
         with torch.no_grad():
             prediction, _, _ = model.rollout(evaluation_inputs)
-            _, _, latent = model.rollout(trajectory_inputs)
+            _, states, latent = model.rollout(trajectory_inputs)
+        valid_states = states[valid_mask_t]
         valid_latent = latent[valid_mask_t]
         mean, components, explained = _display_projection(
             valid_latent,
@@ -128,6 +147,44 @@ def analyze_high_dimensional_checkpoints(
             config.neighborhood_sampling.max_plot_points,
         )
 
+        if (
+            config.trajectory_slow_point_search.enabled
+            and int(epoch) in slow_point_epochs
+        ):
+            refined = refine_full_state_slow_points(
+                model=model,
+                seeds=valid_states[slow_seed_indices],
+                input_condition=config.input_condition,
+                config=config.trajectory_slow_point_search,
+            )
+            refined_state = torch.as_tensor(refined.state, dtype=torch.float64)
+            with torch.no_grad():
+                refined_latent = model.latent(refined_state)
+                refined_coordinates = (
+                    refined_latent
+                    - mean.to(dtype=torch.float64)
+                ) @ components.to(dtype=torch.float64)
+            slow_point_records.append(
+                {
+                    "epoch_index": np.full(
+                        refined.q.shape, len(models), dtype=np.int64
+                    ),
+                    "state": refined.state,
+                    "latent": refined_latent.cpu().numpy(),
+                    "coordinates": refined_coordinates.cpu().numpy(),
+                    "flow": refined.flow,
+                    "q": refined.q,
+                    "q_gradient_norm": refined.q_gradient_norm,
+                    "jacobian_eigenvalues": refined.eigenvalues,
+                    "spectral_abscissa": refined.spectral_abscissa,
+                    "optimization_converged": refined.optimization_converged,
+                    "accepted": refined.accepted,
+                    "is_fixed": refined.is_fixed,
+                    "source_count": refined.source_count,
+                    "source_phase": slow_seed_phases[refined.source_index],
+                }
+            )
+
         models.append(model)
         predictions.append(prediction.cpu().numpy())
         latent_trajectories.append(latent.cpu().numpy())
@@ -147,11 +204,42 @@ def analyze_high_dimensional_checkpoints(
         sampling_radii.append(radius.cpu().numpy())
 
     trajectory_array = np.stack(display_trajectories)
+    slow_point_data = _combine_slow_point_records(
+        slow_point_records,
+        state_size=model_config.state_size,
+        rank=model_config.rank,
+    )
+    neighborhood_coordinate_array = np.stack(neighborhood_display)
+    visible_neighborhood_array = np.logical_or(
+        np.stack(low_q_masks), np.stack(near_zero_masks)
+    )
     display_bounds = _shared_display_bounds(
         trajectory_array,
         trajectory_batch.valid_mask,
-        np.stack(neighborhood_display),
+        neighborhood_coordinate_array,
+        visible_neighborhood_array,
         config.padding_fraction,
+        slow_point_coordinates=slow_point_data["slow_point_coordinates"],
+        slow_point_mask=slow_point_data["slow_point_accepted"],
+    )
+    display_bounds_by_epoch = np.stack(
+        [
+            _shared_display_bounds(
+                trajectory_array[frame : frame + 1],
+                trajectory_batch.valid_mask,
+                neighborhood_coordinate_array[frame : frame + 1],
+                visible_neighborhood_array[frame : frame + 1],
+                config.padding_fraction,
+                slow_point_coordinates=slow_point_data[
+                    "slow_point_coordinates"
+                ],
+                slow_point_mask=(
+                    slow_point_data["slow_point_accepted"]
+                    & (slow_point_data["slow_point_epoch_index"] == frame)
+                ),
+            )
+            for frame in range(len(epochs))
+        ]
     )
     coordinate_kind = "exact_kappa" if model_config.rank == 3 else "trajectory_pca"
     coordinate_labels = (
@@ -172,6 +260,10 @@ def analyze_high_dimensional_checkpoints(
         projection_components=np.stack(projection_components),
         pca_explained_variance_ratio=np.stack(explained_variance_ratios),
         display_bounds=display_bounds,
+        display_bounds_by_epoch=display_bounds_by_epoch,
+        slow_point_search_enabled=np.asarray(
+            config.trajectory_slow_point_search.enabled
+        ),
         trajectory=trajectory_array,
         trajectory_latent=np.stack(latent_trajectories),
         trajectory_target=trajectory_batch.target,
@@ -199,7 +291,7 @@ def analyze_high_dimensional_checkpoints(
             [item.trial_steps for item in trajectory_batch.metadata]
         ),
         neighborhood_latent=np.stack(neighborhood_latent),
-        neighborhood_coordinates=np.stack(neighborhood_display),
+        neighborhood_coordinates=neighborhood_coordinate_array,
         neighborhood_flow=np.stack(neighborhood_flow),
         neighborhood_q=np.stack(neighborhood_q),
         neighborhood_speed=np.sqrt(2.0 * np.stack(neighborhood_q)),
@@ -211,13 +303,16 @@ def analyze_high_dimensional_checkpoints(
         neighborhood_near_zero_mask=np.stack(near_zero_masks),
         neighborhood_low_q_threshold=np.asarray(low_q_thresholds),
         neighborhood_sampling_radius=np.stack(sampling_radii),
+        **slow_point_data,
         prediction=np.stack(predictions),
         target=evaluation_batch.target,
         valid_mask=evaluation_batch.valid_mask,
         inputs=evaluation_batch.inputs,
         input_condition=np.asarray(config.input_condition),
         task_name=np.asarray(task.config.name),
-        trial_interval=np.asarray([item.interval for item in evaluation_batch.metadata]),
+        trial_interval=np.asarray(
+            [item.interval for item in evaluation_batch.metadata]
+        ),
         trial_delay=np.asarray([item.delay for item in evaluation_batch.metadata]),
         trial_s1_step=np.asarray([item.s1_step for item in evaluation_batch.metadata]),
         trial_s2_step=np.asarray([item.s2_step for item in evaluation_batch.metadata]),
@@ -225,7 +320,9 @@ def analyze_high_dimensional_checkpoints(
         trial_response_step=np.asarray(
             [item.response_step for item in evaluation_batch.metadata]
         ),
-        trial_steps=np.asarray([item.trial_steps for item in evaluation_batch.metadata]),
+        trial_steps=np.asarray(
+            [item.trial_steps for item in evaluation_batch.metadata]
+        ),
     )
 
     metadata_path = output_dir / "latent_dynamics.yaml"
@@ -285,6 +382,26 @@ def analyze_high_dimensional_checkpoints(
                 "interpretation": (
                     "descriptive sampled regions; not fixed points, ghost "
                     "mechanisms, or invariant slow manifolds"
+                ),
+            },
+            "trajectory_slow_point_search": {
+                **asdict(config.trajectory_slow_point_search),
+                "epochs": sorted(slow_point_epochs),
+                "seed_space": "full neural state x along valid task trajectories",
+                "seed_selection": "phase-stratified without spatial perturbation",
+                "optimization_space": "full neural state x",
+                "q_definition": "q_x=0.5*||F_x||_2^2",
+                "acceptance": (
+                    "finite optimized endpoint with q_x <= q_threshold; "
+                    "stationarity is recorded separately"
+                ),
+                "jacobian": (
+                    "exact analytic full-state J_x evaluated at the same "
+                    "optimized endpoints"
+                ),
+                "projection": (
+                    "exact kappa for rank 3 or trajectory PCA for rank > 3, "
+                    "applied only after full-state optimization and Jacobian"
                 ),
             },
             "evaluation_trials": [asdict(item) for item in config.evaluation_trials],
@@ -399,6 +516,87 @@ def _sample_trajectory_neighborhood(
     return samples.reshape(-1, valid_latent.shape[1]), radius
 
 
+def _phase_stratified_seed_indices(
+    batch: TaskBatch,
+    *,
+    seed_count: int,
+    seed: int,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Select trajectory-state seeds while preventing long phases dominating."""
+    phase_names = np.full(batch.valid_mask.shape, "baseline", dtype="<U20")
+    for trial, metadata in enumerate(batch.metadata):
+        length = int(batch.valid_mask[trial].sum())
+        boundaries = (
+            ("interval_encoding", metadata.s1_step, metadata.s2_step),
+            ("delay", metadata.s2_step, metadata.go_step),
+            ("post_go_timing", metadata.go_step, metadata.response_step),
+            ("response", metadata.response_step, length),
+        )
+        for name, start, stop in boundaries:
+            start = max(0, min(int(start), length))
+            stop = max(start, min(int(stop), length))
+            phase_names[trial, start:stop] = name
+
+    valid_phases = phase_names[batch.valid_mask]
+    groups = [name for name in np.unique(valid_phases) if np.any(valid_phases == name)]
+    rng = np.random.default_rng(seed)
+    allocation = int(np.ceil(seed_count / len(groups)))
+    selected: list[np.ndarray] = []
+    for name in groups:
+        candidates = np.flatnonzero(valid_phases == name)
+        count = min(allocation, candidates.size)
+        selected.append(rng.choice(candidates, size=count, replace=False))
+    indices = np.concatenate(selected)
+    if indices.size > seed_count:
+        indices = rng.choice(indices, size=seed_count, replace=False)
+    elif indices.size < min(seed_count, valid_phases.size):
+        remaining = np.setdiff1d(
+            np.arange(valid_phases.size), indices, assume_unique=False
+        )
+        extra = rng.choice(
+            remaining,
+            size=min(seed_count - indices.size, remaining.size),
+            replace=False,
+        )
+        indices = np.concatenate((indices, extra))
+    rng.shuffle(indices)
+    return torch.as_tensor(indices, dtype=torch.long), valid_phases[indices]
+
+
+def _combine_slow_point_records(
+    records: Sequence[Mapping[str, np.ndarray]],
+    *,
+    state_size: int,
+    rank: int,
+) -> dict[str, np.ndarray]:
+    if not records:
+        return {
+            "slow_point_epoch_index": np.empty(0, dtype=np.int64),
+            "slow_point_state": np.empty((0, state_size), dtype=np.float64),
+            "slow_point_latent": np.empty((0, rank), dtype=np.float64),
+            "slow_point_coordinates": np.empty((0, 3), dtype=np.float64),
+            "slow_point_flow": np.empty((0, state_size), dtype=np.float64),
+            "slow_point_q": np.empty(0, dtype=np.float64),
+            "slow_point_q_gradient_norm": np.empty(0, dtype=np.float64),
+            "slow_point_jacobian_eigenvalues": np.empty(
+                (0, state_size), dtype=np.complex128
+            ),
+            "slow_point_spectral_abscissa": np.empty(0, dtype=np.float64),
+            "slow_point_optimization_converged": np.empty(0, dtype=np.bool_),
+            "slow_point_accepted": np.empty(0, dtype=np.bool_),
+            "slow_point_is_fixed": np.empty(0, dtype=np.bool_),
+            "slow_point_source_count": np.empty(0, dtype=np.int64),
+            "slow_point_source_phase": np.empty(0, dtype="<U20"),
+        }
+    names = tuple(records[0])
+    return {
+        f"slow_point_{name}": np.concatenate(
+            [record[name] for record in records], axis=0
+        )
+        for name in names
+    }
+
+
 def _cap_mask(
     mask: torch.Tensor, score: torch.Tensor, maximum: int
 ) -> torch.Tensor:
@@ -415,10 +613,22 @@ def _shared_display_bounds(
     trajectories: np.ndarray,
     valid_mask: np.ndarray,
     neighborhoods: np.ndarray,
+    visible_neighborhood_mask: np.ndarray,
     padding_fraction: float,
+    *,
+    slow_point_coordinates: np.ndarray | None = None,
+    slow_point_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     valid = trajectories[:, valid_mask, :].reshape(-1, 3)
-    points = np.concatenate((valid, neighborhoods.reshape(-1, 3)), axis=0)
+    point_groups = [valid]
+    visible_neighborhoods = neighborhoods[visible_neighborhood_mask]
+    if visible_neighborhoods.size:
+        point_groups.append(visible_neighborhoods.reshape(-1, 3))
+    if slow_point_coordinates is not None and slow_point_mask is not None:
+        visible_slow_points = slow_point_coordinates[slow_point_mask]
+        if visible_slow_points.size:
+            point_groups.append(visible_slow_points.reshape(-1, 3))
+    points = np.concatenate(point_groups, axis=0)
     minima = points.min(axis=0)
     maxima = points.max(axis=0)
     center = 0.5 * (minima + maxima)

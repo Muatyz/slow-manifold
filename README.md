@@ -176,7 +176,7 @@ representative_selection:
   manual_epochs: []
 ```
 
-改变 selection 规则或 `--representative-epochs` 只重选帧和重绘；只要 latent analysis 参数没有变化，就不会重新计算 vector field/Jacobian 或高维邻域诊断。
+K=2 时，改变 selection 规则或 `--representative-epochs` 只重选帧和重绘。K≥3 的 full-state slow-point refinement 只在代表性 checkpoints 上执行，因此改变所选 epochs 会触发相应 structured diagnostics 重算，并写入 analysis 指纹。
 
 默认目录由完整 task/model/train 配置指纹与 seed 决定：
 
@@ -186,9 +186,9 @@ runs\<name>\<condition>--cfg-<fingerprint>\seed-<seed>
 
 同配置、同 seed 不会覆盖已有结果。根 `config.yaml` 是不可修改的训练记录；`diagnostics/config.yaml` 与 `figures/config.yaml` 分别保存最近一次成功使用的完整 analysis/visualization 配置、来源与指纹。analysis 指纹不变时直接复用结构化 diagnostics，变化时从 checkpoints 重算；所有阶段事件追加到 `run.log`。
 
-`figures/latent_dynamics/` 是统一入口。K=2 时保存 vector field/Jacobian 双栏 snapshots，两个独立目录继续保留单栏图；其轨迹颜色区分任务条件、线型区分任务阶段。K≥3 时不构造难以解释的 3-D quiver，而保存 trajectories、sampled low-`q` region、near-zero spectral-abscissa region 三栏 3-D snapshots；轨迹段以颜色（并冗余使用线型）区分 interval encoding、delay、timing/reproduction 与 response，终点 marker 再编码 short/long 或 interval 条件。实际 `u≠0` 的 cue-driven 位移段显示为黄色。MP4 仅在 `render_movies: true` 时生成。
+`figures/latent_dynamics/` 是统一入口。K=2 时保存 vector field/Jacobian 双栏 snapshots，两个独立目录继续保留单栏图；其轨迹颜色区分任务条件、线型区分任务阶段。K≥3 时不构造难以解释的 3-D quiver，而保存 trajectories、optimized slow points（按 `q_x` 着色）、同一批点的 full-state spectral abscissa 三栏 3-D snapshots；`q_x` 使用只由当前展示点决定的鲁棒对数色标，谱色标以 0 为中心，三栏共享逐 checkpoint 推导的坐标范围，避免被其他训练阶段的极值压缩。最后一个代表性 checkpoint 还会在 `latent_dynamics/single_trajectory/` 输出一张中位 interval 附近的单 trajectory 示意图，并按该轨迹单独取 bounds。轨迹段以颜色（并冗余使用线型）区分 interval encoding、delay、timing/reproduction 与 response，终点 marker 再编码 short/long 或 interval 条件。实际 `u≠0` 的 cue-driven 位移段在 Task A 中显示为黄色加黑色描边，在 Task B 中按 Ramesan 风格显示为无黑色包络的红线；3-D 图的红色 cue overlay 使用独立 alpha 和线宽缩放，减少遮挡。MP4 仅在 `render_movies: true` 时生成。
 
-坐标策略没有 K=4 缺口：K=3 直接显示 exact `κ=Nᵀx` 的三个坐标；K>3（包括 K=4）用 task-trajectory `κ` states 拟合 PC1–3。PCA 只用于显示；邻域采样、`q=½‖τFκ‖²`、K×K exact latent Jacobian 与 `max Re(λ)` 都在完整 K 维 κ 空间计算。低 `q` 和 near-zero-spectrum 点只是轨迹邻域中的描述性样本，不能单独作为 fixed point、ghost 或 invariant slow manifold 的证据。
+坐标策略没有 K=4 缺口：K=3 直接显示 exact `κ=Nᵀx` 的三个坐标；K>3（包括 K=4）用 task-trajectory `κ` states 拟合 PC1–3。主 slow-point 搜索按任务阶段分层抽取 trajectory full states，连续最小化 `q_x=½‖F_x‖²`，以 `q_x≤10⁻⁴` 接受，并在相同优化端点计算解析 full-state Jacobian 与 `max Re(λ(J_x))`；PCA 只用于最终显示。原有 K 维 κ 邻域的 `qκ`/Jacobian samples 仍保存在 structured diagnostics 中作为探索性候选，不能单独作为 fixed point、ghost 或 invariant slow manifold 的证据。
 
 κ 平面的网格与形状由 analysis config 控制：
 
@@ -206,12 +206,19 @@ evaluation_trials:              # Task A: 阈值 5 两侧各取两个 T
 
 Task B 在 experiment override 中使用 `T=30,50,75,99`。修改 `evaluation_trials` 会改变 structured diagnostics 并触发重算。`grid_points` 同时作用于 speed 和 Jacobian 色块；提高到 `81` 会更细，但网格计算量约按 `grid_points²` 增长。
 
-轨迹显示由 visualization config 控制；主线、基线、cue overlay、描边和终点 marker 会同比缩放：
+轨迹显示由 visualization config 控制；主线、基线、cue overlay、Task A cue 描边和终点 marker 会同比缩放：
 
 ```yaml
 # configs/visualization/training_dynamics.yaml
 loss_y_scale: log              # loss 纵轴；可改为 linear
 trajectory_line_width: 0.9
+trajectory_3d_alpha: 0.62
+trajectory_3d_cue_alpha_scale: 0.55
+trajectory_3d_cue_line_width_scale: 0.8
+trajectory_3d_view_elevation: 26.0
+trajectory_3d_view_azimuth: -68.0
+single_trajectory_enabled: true
+single_trajectory_interval_quantile: 0.5
 snapshot_dpi: 240              # PNG；用于论文/放大检查
 movie_dpi: 120                 # MP4；与 PNG 解耦以控制编码成本
 render_movies: false           # 高开销实验默认只保存静态图

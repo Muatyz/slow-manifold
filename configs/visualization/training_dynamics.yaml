@@ -10,6 +10,18 @@ latent_dynamics_figure_size: [12.0, 6.0]
 # K>=3 的 trajectory / low-q / near-zero-spectrum 三栏 3-D 画布。
 latent_dynamics_3d_figure_size: [18.0, 6.0]
 max_3d_trajectories: 64
+# K>=3 multi-trajectory readability. The cue overlay has its own alpha/width
+# scale so Task B's red signal segments do not hide the subsequent phases.
+trajectory_3d_alpha: 0.62
+trajectory_3d_cue_alpha_scale: 0.55
+trajectory_3d_cue_line_width_scale: 0.8
+trajectory_3d_view_elevation: 26.0
+trajectory_3d_view_azimuth: -68.0
+# Add one uncluttered schematic at the final representative checkpoint. The
+# trial nearest the configured interval quantile is selected deterministically.
+single_trajectory_enabled: true
+single_trajectory_figure_size: [7.0, 6.0]
+single_trajectory_interval_quantile: 0.5
 # PNG 与 MP4 分开控制，避免 smoke movie 的成本设置降低静态图清晰度。
 snapshot_dpi: 240
 movie_dpi: 120

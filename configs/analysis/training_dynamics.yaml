@@ -25,7 +25,7 @@ grid_points: 100
 coordinate_bounds: null
 # 将较短轴围绕中心扩展到与较长轴等跨度；不拉伸或裁剪相平面。
 square_coordinate_bounds: true
-padding_fraction: 0.2
+padding_fraction: 0.1
 bounds_expansion_fraction: 0.5
 max_bounds_expansions: 2
 speed_floor: 1.0e-8
@@ -43,6 +43,20 @@ neighborhood_sampling:
   low_q_quantile: 0.05
   near_zero_eigenvalue_tolerance: 1.0e-2
   max_plot_points: 512
+# K>=3: Ramesan-style full-state refinement. Valid task-trajectory states are
+# phase-stratified seeds for continuous minimization of q_x=0.5*||F_x||^2.
+# The full-state Jacobian is evaluated at these same optimized endpoints.
+trajectory_slow_point_search:
+  enabled: true
+  seed_count: 512
+  max_iterations: 75
+  optimization_batch_size: 64
+  optimizer_gradient_tolerance: 1.0e-8
+  parameter_tolerance: 1.0e-12
+  stationarity_tolerance: 1.0e-6
+  q_threshold: 1.0e-4
+  fixed_q_tolerance: 1.0e-10
+  deduplication_tolerance: 1.0e-3
 # 先以八邻域筛选网格候选，再连续最小化 q=0.5*||tau*F_kappa||^2。
 speed_minimum_classification:
   max_iterations: 75

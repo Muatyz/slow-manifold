@@ -34,6 +34,10 @@ overrides:
       anchor_count: 8
       samples_per_anchor: 2
       max_plot_points: 24
+    trajectory_slow_point_search:
+      seed_count: 12
+      max_iterations: 8
+      optimization_batch_size: 6
   visualization:
     training_curves_figure_size: [6.0, 4.0]
     outputs_panel_width: 3.0

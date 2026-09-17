@@ -11,6 +11,9 @@ from slow_manifold.models import Rank2CTRNN, Rank2CTRNNConfig
 from slow_manifold.training.checkpoint import load_checkpoint
 from slow_manifold.visualization.training_dynamics import (
     _cue_driven_point_ranges,
+    _cue_line_width,
+    _cue_path_effects,
+    _cue_trajectory_color,
     _validate_y_scale,
 )
 from slow_manifold.workflows import (
@@ -44,6 +47,23 @@ def test_cue_driven_ranges_include_the_input_generated_transition() -> None:
     inputs[6, 0] = 1.0
 
     assert _cue_driven_point_ranges(inputs) == [(1, 4), (5, 7)]
+
+
+def test_task_b_cue_overlay_is_a_single_red_line() -> None:
+    reproduction = {
+        "task_name": np.asarray("delayed_interval_reproduction")
+    }
+    categorization = {
+        "task_name": np.asarray("delayed_interval_categorization")
+    }
+
+    assert _cue_trajectory_color(reproduction) == "tab:red"
+    assert _cue_path_effects(reproduction, 1.5) == ()
+    assert _cue_line_width(reproduction, 1.5) < _cue_line_width(
+        categorization, 1.5
+    )
+    assert _cue_trajectory_color(categorization) == "#F0E442"
+    assert _cue_path_effects(categorization, 1.5)
 
 
 def test_log_loss_axis_rejects_nonpositive_values() -> None:

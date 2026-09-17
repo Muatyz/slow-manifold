@@ -17,6 +17,97 @@ class SpeedMinimumConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class TrajectorySlowPointSearchConfig:
+    """Full-state slow-point refinement seeded from task trajectories."""
+
+    enabled: bool = True
+    seed_count: int = 512
+    max_iterations: int = 75
+    optimization_batch_size: int = 64
+    optimizer_gradient_tolerance: float = 1.0e-8
+    parameter_tolerance: float = 1.0e-12
+    stationarity_tolerance: float = 1.0e-6
+    q_threshold: float = 1.0e-4
+    fixed_q_tolerance: float = 1.0e-10
+    deduplication_tolerance: float = 1.0e-3
+
+    @classmethod
+    def from_mapping(
+        cls, data: Mapping[str, Any] | None
+    ) -> "TrajectorySlowPointSearchConfig":
+        if data is not None and not isinstance(data, Mapping):
+            raise SpeedMinimumConfigError(
+                "trajectory_slow_point_search must be a mapping"
+            )
+        raw = {} if data is None else data
+        try:
+            config = cls(
+                enabled=_mapping_bool(raw, "enabled", cls.enabled),
+                seed_count=int(raw.get("seed_count", cls.seed_count)),
+                max_iterations=int(raw.get("max_iterations", cls.max_iterations)),
+                optimization_batch_size=int(
+                    raw.get("optimization_batch_size", cls.optimization_batch_size)
+                ),
+                optimizer_gradient_tolerance=float(
+                    raw.get(
+                        "optimizer_gradient_tolerance",
+                        cls.optimizer_gradient_tolerance,
+                    )
+                ),
+                parameter_tolerance=float(
+                    raw.get("parameter_tolerance", cls.parameter_tolerance)
+                ),
+                stationarity_tolerance=float(
+                    raw.get("stationarity_tolerance", cls.stationarity_tolerance)
+                ),
+                q_threshold=float(raw.get("q_threshold", cls.q_threshold)),
+                fixed_q_tolerance=float(
+                    raw.get("fixed_q_tolerance", cls.fixed_q_tolerance)
+                ),
+                deduplication_tolerance=float(
+                    raw.get(
+                        "deduplication_tolerance", cls.deduplication_tolerance
+                    )
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise SpeedMinimumConfigError(
+                f"Invalid trajectory slow-point config: {error}"
+            ) from error
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if min(
+            self.seed_count,
+            self.max_iterations,
+            self.optimization_batch_size,
+        ) <= 0:
+            raise SpeedMinimumConfigError(
+                "trajectory slow-point counts and iterations must be positive"
+            )
+        tolerances = (
+            self.optimizer_gradient_tolerance,
+            self.parameter_tolerance,
+            self.stationarity_tolerance,
+            self.q_threshold,
+            self.fixed_q_tolerance,
+            self.deduplication_tolerance,
+        )
+        if any(value <= 0 for value in tolerances):
+            raise SpeedMinimumConfigError(
+                "trajectory slow-point tolerances must be positive"
+            )
+
+
+def _mapping_bool(data: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise TypeError(f"{key} must be boolean")
+    return value
+
+
+@dataclass(frozen=True)
 class SpeedMinimumClassificationConfig:
     """Numerical tolerances for Dinc-style speed-minimum classification."""
 
@@ -106,6 +197,166 @@ class ClassifiedSpeedMinima:
     is_attractor: NDArray[np.bool_]
     classification: NDArray[np.str_]
     source_count: NDArray[np.integer]
+
+
+@dataclass(frozen=True)
+class FullStateSlowPoints:
+    """Optimized and deduplicated full-state candidates for one checkpoint."""
+
+    state: NDArray[np.floating]
+    flow: NDArray[np.floating]
+    q: NDArray[np.floating]
+    q_gradient_norm: NDArray[np.floating]
+    eigenvalues: NDArray[np.complexfloating]
+    spectral_abscissa: NDArray[np.floating]
+    optimization_converged: NDArray[np.bool_]
+    accepted: NDArray[np.bool_]
+    is_fixed: NDArray[np.bool_]
+    source_count: NDArray[np.integer]
+    source_index: NDArray[np.integer]
+
+
+def refine_full_state_slow_points(
+    *,
+    model: Rank2CTRNN,
+    seeds: torch.Tensor,
+    input_condition: Sequence[float],
+    config: TrajectorySlowPointSearchConfig,
+) -> FullStateSlowPoints:
+    """Minimize ``q_x=0.5*||F_x||^2`` from trajectory-state seeds.
+
+    This follows the fixed/slow-point search used by Ramesan et al.: task
+    trajectory states initialize continuous optimization in the full neural
+    state space.  Acceptance uses the configured absolute q threshold;
+    stationarity is saved separately instead of silently changing that rule.
+    """
+    if seeds.ndim != 2 or seeds.shape[1] != model.config.state_size:
+        raise ValueError("seeds must have shape [count, state_size]")
+    if seeds.shape[0] == 0:
+        return _empty_full_state_result(model.config.state_size)
+
+    model.to(dtype=torch.float64)
+    points = seeds.detach().to(dtype=torch.float64)
+    input_vector = torch.as_tensor(
+        input_condition, dtype=torch.float64, device=points.device
+    )
+    optimized: list[torch.Tensor] = []
+    for start in range(0, points.shape[0], config.optimization_batch_size):
+        chunk = points[start : start + config.optimization_batch_size].clone()
+        chunk.requires_grad_(True)
+        inputs = input_vector.expand(chunk.shape[0], -1)
+        optimizer = torch.optim.LBFGS(
+            [chunk],
+            lr=1.0,
+            max_iter=config.max_iterations,
+            tolerance_grad=config.optimizer_gradient_tolerance,
+            tolerance_change=config.parameter_tolerance,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure() -> torch.Tensor:
+            optimizer.zero_grad()
+            q = 0.5 * model.flow(chunk, inputs).square().sum(dim=-1)
+            total = q.sum()
+            total.backward()
+            return total
+
+        optimizer.step(closure)
+        optimized.append(chunk.detach())
+
+    refined = torch.cat(optimized, dim=0)
+    refined, source_counts, source_indices = _deduplicate_full_state_points(
+        refined,
+        model=model,
+        input_condition=input_vector,
+        tolerance=config.deduplication_tolerance,
+    )
+    coordinates = refined.detach().clone().requires_grad_(True)
+    inputs = input_vector.expand(coordinates.shape[0], -1)
+    flow = model.flow(coordinates, inputs)
+    q = 0.5 * flow.square().sum(dim=-1)
+    gradient = torch.autograd.grad(q.sum(), coordinates)[0]
+    with torch.no_grad():
+        jacobian = model.full_state_jacobian(coordinates, inputs)
+        eigenvalues = torch.linalg.eigvals(jacobian)
+        spectral_abscissa = eigenvalues.real.max(dim=-1).values
+        gradient_norm = torch.linalg.vector_norm(gradient, dim=-1)
+        finite = (
+            torch.isfinite(q)
+            & torch.isfinite(gradient_norm)
+            & torch.isfinite(spectral_abscissa)
+        )
+        accepted = finite & (q <= config.q_threshold)
+        converged = finite & (gradient_norm <= config.stationarity_tolerance)
+        fixed = accepted & (q <= config.fixed_q_tolerance)
+
+    return FullStateSlowPoints(
+        state=coordinates.detach().cpu().numpy(),
+        flow=flow.detach().cpu().numpy(),
+        q=q.detach().cpu().numpy(),
+        q_gradient_norm=gradient_norm.cpu().numpy(),
+        eigenvalues=eigenvalues.cpu().numpy(),
+        spectral_abscissa=spectral_abscissa.cpu().numpy(),
+        optimization_converged=converged.cpu().numpy(),
+        accepted=accepted.cpu().numpy(),
+        is_fixed=fixed.cpu().numpy(),
+        source_count=source_counts,
+        source_index=source_indices,
+    )
+
+
+def _deduplicate_full_state_points(
+    points: torch.Tensor,
+    *,
+    model: Rank2CTRNN,
+    input_condition: torch.Tensor,
+    tolerance: float,
+) -> tuple[torch.Tensor, NDArray[np.int64], NDArray[np.int64]]:
+    with torch.no_grad():
+        inputs = input_condition.expand(points.shape[0], -1)
+        q = 0.5 * model.flow(points, inputs).square().sum(dim=-1)
+    order = torch.argsort(q)
+    unique: list[torch.Tensor] = []
+    counts: list[int] = []
+    source_indices: list[int] = []
+    for index_tensor in order:
+        index = int(index_tensor)
+        point = points[index]
+        match = next(
+            (
+                candidate_index
+                for candidate_index, candidate in enumerate(unique)
+                if torch.linalg.vector_norm(point - candidate) <= tolerance
+            ),
+            None,
+        )
+        if match is None:
+            unique.append(point)
+            counts.append(1)
+            source_indices.append(index)
+        else:
+            counts[match] += 1
+    return (
+        torch.stack(unique),
+        np.asarray(counts, dtype=np.int64),
+        np.asarray(source_indices, dtype=np.int64),
+    )
+
+
+def _empty_full_state_result(state_size: int) -> FullStateSlowPoints:
+    return FullStateSlowPoints(
+        state=np.empty((0, state_size), dtype=np.float64),
+        flow=np.empty((0, state_size), dtype=np.float64),
+        q=np.empty(0, dtype=np.float64),
+        q_gradient_norm=np.empty(0, dtype=np.float64),
+        eigenvalues=np.empty((0, state_size), dtype=np.complex128),
+        spectral_abscissa=np.empty(0, dtype=np.float64),
+        optimization_converged=np.empty(0, dtype=np.bool_),
+        accepted=np.empty(0, dtype=np.bool_),
+        is_fixed=np.empty(0, dtype=np.bool_),
+        source_count=np.empty(0, dtype=np.int64),
+        source_index=np.empty(0, dtype=np.int64),
+    )
 
 
 def refine_and_classify_speed_minima(

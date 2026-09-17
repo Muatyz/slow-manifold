@@ -89,9 +89,9 @@ figures/
 - 修改 learning rate 等训练条件必须修改 component/experiment override；不得只改目录名。相同训练配置与 seed 继续拒绝覆盖。
 - stochastic rollout 由 `train.rollout` 单点定义：初态为 `tanh_normal`，neural noise 为逐 Euler step、`tanh` 内部的 `activation_input` Gaussian noise。缺失该区块的历史配置按两个 `std=0` 解析。train/validation 的 initial-state 与 neural-noise RNG 相互独立并写入 checkpoint；确定性 vector field/Jacobian 不采样 noise。
 
-`figures/latent_dynamics/` 是统一的动力学图入口。rank-2 保存同一 aligned κ 网格上的 vector field/Jacobian 双栏 snapshots 与可选同步 MP4；`figures/latent_vector_field/` 和 `figures/latent_jacobian/` 保留兼容性独立图。rank≥3 不画 3-D vector field，而保存 trajectories、sampled low-q region 与 near-zero spectral-abscissa region 三栏 3-D 图；高维 trajectory 以颜色和线型编码任务阶段，以终点 marker 编码任务条件。K=3 使用 exact κ 三坐标；K>3（含 K=4）用 task-trajectory κ states 的 PC1–3 显示，但 q、flow 与 Jacobian 必须在完整 K 维 exact latent space 计算。低 q/near-zero 邻域样本只作描述性候选，不得直接标作 slow point、ghost 或 slow manifold。
+`figures/latent_dynamics/` 是统一的动力学图入口。rank-2 保存同一 aligned κ 网格上的 vector field/Jacobian 双栏 snapshots 与可选同步 MP4；`figures/latent_vector_field/` 和 `figures/latent_jacobian/` 保留兼容性独立图。rank≥3 不画 3-D vector field，而保存 trajectories、optimized slow points 与同一组点的 full-state Jacobian spectral abscissa 三栏 3-D 图；高维 trajectory 以颜色和线型编码任务阶段，以终点 marker 编码任务条件。slow-point search 从按任务阶段分层抽取的 trajectory full states 初始化，连续最小化 `q_x=1/2||F_x||²`，在相同优化端点计算解析 full-state `J_x`；K=3 使用 exact κ 三坐标，K>3（含 K=4）用 task-trajectory κ states 的 PC1–3 显示，投影不得进入 q、优化、Jacobian 或 acceptance 定义。旧的 K 维 κ neighborhood samples 继续保存为探索性候选，不得直接标作 slow point、ghost 或 slow manifold。
 
-task trajectory 使用正交视觉编码：颜色表示任务条件（Task A 使用蓝/橙区分 short/long；Task B 使用 plasma 编码 interval `T`），线型表示任务阶段——实线为 S1→S2 interval encoding，虚线为 S2→Go delay，点划线为 Go→target response onset 的 timing/reproduction，点线为 response。轨迹使用白色描边，以同时避开 viridis speed 与 coolwarm Jacobian 背景；实际 `u≠0` 的 cue-driven 位移段覆盖为黄线加黑色描边。`trajectory_line_width` 统一缩放主线、基线、cue overlay、描边与终点 marker。S1 前基线仅用细透明线显示。snapshot、独立图和启用时的 MP4 必须复用这一语义。
+task trajectory 使用正交视觉编码：颜色表示任务条件（Task A 使用蓝/橙区分 short/long；Task B 使用 plasma 编码 interval `T`），线型表示任务阶段——实线为 S1→S2 interval encoding，虚线为 S2→Go delay，点划线为 Go→target response onset 的 timing/reproduction，点线为 response。轨迹使用白色描边，以同时避开 viridis speed 与 coolwarm Jacobian 背景。实际 `u≠0` 的 cue-driven 位移段在 Task A 中覆盖为黄线加黑色描边；Task B 借鉴 Ramesan 图示覆盖为单层红线，不加黑色包络，并使用独立的 alpha/line-width scale，避免密集 trajectories 相互遮挡。K≥3 还应为最后一个 representative checkpoint 输出一张确定性选择的单 trajectory 示意图，复用相同阶段语义但按该轨迹单独取 bounds。`trajectory_line_width` 统一缩放主线、基线、cue overlay、Task A cue 描边与终点 marker。S1 前基线仅用细透明线显示。snapshot、独立图和启用时的 MP4 必须复用这一语义。
 
 κ-plane Jacobian map 展示 `max Re(λ(J_κ))` 的描述性采样。speed minima 先由八邻域网格筛查，再连续最小化 `q=1/2||τF_κ||²`；分类阈值、Hessian、Jacobian 和收敛状态必须保存在 structured diagnostics。latent transverse-stable slow point 只标记为 `G*` candidate；未经 full-state 与 task-relevance 验证，不得表述为 ghost mechanism、slow manifold 或 bifurcation。
 
@@ -105,9 +105,9 @@ decision band 染色的语义约定（与 Dinc 原文一致，勿把“模糊区
 `render_movies` 时按旧行为开启；仅有 `vector_field_dpi` 时，将其同时作为两种
 DPI 的兼容 fallback。
 
-representative checkpoints 在训练后由 analysis 规则从 `metrics.csv` 与实际 checkpoints 选择，结果与判据写入 `diagnostics/checkpoint_selection.yaml`；配置只保存规则，不预填自动模式的 epoch。罗马数字只表示展示顺序，角色才承载语义；`abrupt`、`quasi_plateau` 与 `mature` 均为描述性标签，不等同于机制、optimum 或“已学会”。`--representative-epochs` 提供可追溯的人工替换。selection 不影响 latent grid/Jacobian 指纹，单独改选帧不得触发不必要的动力学重算。
+representative checkpoints 在训练后由 analysis 规则从 `metrics.csv` 与实际 checkpoints 选择，结果与判据写入 `diagnostics/checkpoint_selection.yaml`；配置只保存规则，不预填自动模式的 epoch。罗马数字只表示展示顺序，角色才承载语义；`abrupt`、`quasi_plateau` 与 `mature` 均为描述性标签，不等同于机制、optimum 或“已学会”。`--representative-epochs` 提供可追溯的人工替换。rank-2 selection 不影响 latent grid/Jacobian 指纹；rank≥3 的高成本 full-state slow-point refinement 只在 representative checkpoints 上运行，因此所选 epochs 必须进入 analysis 指纹。
 
-分析坐标范围：显式 `coordinate_bounds` 优先；为 `null` 时由 trajectory 推导，并在 grid-minimum 候选贴近网格边缘（慢结构可能被截断）时按 `bounds_expansion_fraction`/`max_bounds_expansions` 自动向外扩张；`coordinate_bounds_source` 与最终范围写入 `latent_dynamics.yaml`。
+分析坐标范围：显式 `coordinate_bounds` 优先；为 `null` 时，rank-2 由 trajectory 推导，并在 grid-minimum 候选贴近网格边缘（慢结构可能被截断）时按 `bounds_expansion_fraction`/`max_bounds_expansions` 自动向外扩张；rank≥3 的 3-D bounds 按 checkpoint 由实际显示的 trajectories 和诊断点推导，不得让其他 epoch 或未绘制样本压缩当前帧主体，同一 checkpoint 的三个子图必须复用相同范围。单 trajectory 示意图为强调阶段结构，可只从该轨迹推导局部 bounds。`coordinate_bounds_source` 与最终范围写入 structured diagnostics。
 
 κ 平面形状由 analysis 配置 `square_coordinate_bounds` 控制；为 `true` 时围绕中心扩展较短轴，不裁剪、不拉伸。`grid_points` 是每轴共同采样数，同时决定 speed/Jacobian 色块分辨率；`arrow_stride` 只控制 quiver 箭头抽样，不改变诊断网格。
 
